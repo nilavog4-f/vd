@@ -1,0 +1,7 @@
+requests
+rich
+pyfiglet
+ddgs
+flask
+beautifulsoup4
+phonenumbers
