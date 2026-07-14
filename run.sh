@@ -176,7 +176,7 @@ show_menu() {
     "11" "Scare Prank"     "scare_prank.sh"       "Fake hack scare screen — harmless prank"         "$CRIMSON" "<no input — just run it>"
     "12" "Ping Monitor"    "ping_check.py"        "Live RTT · stability · DDoS detection · MC"      "$ORANGE"  "<ip or hostname + port>"
     "13" "Port Scanner"    "port_scan.py"         "TCP/UDP · banner grab · Minecraft · vuln flags"  "$BLOOD"   "<ip address or hostname>"
-    "14" "Stress Test"     "ddos_simple.py"       "hping3 · real packets · geo map · infinite run"  "$CRIMSON" "<target ip + port + mode>"
+    "14" "DDOS"            "ddos_simple.py"       "raw sockets · geo map · infinite · needs sudo"   "$CRIMSON" "<target ip + port + mode>"
   )
 
   local i=0
@@ -240,6 +240,39 @@ launch_sh() {
 }
 
 # ── Python launcher ───────────────────────────────────────────
+launch_sudo() {
+  local script="$1" label="$2" col="${3:-$LR}"
+  if [ ! -f "$script" ]; then
+    echo ""
+    echo -e "  ${ERR}  ${LW}${script}${RST} ${GRAY}not found in $(pwd)${RST}"
+    echo ""
+    sleep 2; return
+  fi
+
+  clear; echo ""
+  rule "═" "$BLOOD"
+  echo ""
+  center "${BLOOD}▶▶  ${col}${BOLD}${label}${RST}  ${BLOOD}◀◀${RST}"
+  echo ""
+  rule "═" "$BLOOD"
+  echo ""
+
+  sudo python3 "$script"
+  local rc=$?
+
+  echo ""
+  rule "═" "$BLOOD"
+  if [ $rc -eq 0 ]; then
+    center "${LG}✔  ${label} exited cleanly${RST}"
+  else
+    center "${LR}✘  ${label} exited with code ${rc}${RST}"
+  fi
+  rule "═" "$BLOOD"
+  echo ""
+  echo -e "  ${DIM}Press Enter to return to the menu...${RST}"
+  read -r
+}
+
 launch() {
   local script="$1" label="$2" col="${3:-$LR}"
   if [ ! -f "$script" ]; then
@@ -295,7 +328,7 @@ while true; do
     11) launch_sh "scare_prank.sh"   "Scare Prank"   "$CRIMSON";;
     12) launch "ping_check.py"       "Ping Monitor"  "$ORANGE"  ;;
     13) launch "port_scan.py"        "Port Scanner"  "$BLOOD"   ;;
-    14) launch "ddos_simple.py"      "Stress Test"   "$CRIMSON" ;;
+    14) launch_sudo "ddos_simple.py"  "DDOS"          "$CRIMSON" ;;
     q|Q|quit|exit)
       clear; echo ""
       rule "═" "$BLOOD"
