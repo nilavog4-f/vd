@@ -607,7 +607,7 @@ def resolve(target: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 
-N_THREADS    = 24    # sender threads
+N_THREADS    = 64    # sender threads
 
 def run(target: str, port: int, mode: dict):
     stats     = Stats()
