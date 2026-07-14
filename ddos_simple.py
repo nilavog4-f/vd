@@ -606,7 +606,7 @@ def resolve(target: str) -> str:
 # RUN — INFINITE ATTACK LOOP
 # ══════════════════════════════════════════════════════════════════
 
-N_THREADS    = 24    # sender threads
+N_THREADS    = 16    # sender threads
 POOL_SIZE    = 1000  # pre-built packets per thread (eliminates per-send struct overhead)
 BATCH_REPORT = 500   # how often each thread reports to Stats
 
