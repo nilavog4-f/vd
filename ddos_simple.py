@@ -607,8 +607,6 @@ def resolve(target: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 N_THREADS    = 16    # sender threads
-POOL_SIZE    = 1000  # pre-built packets per thread (eliminates per-send struct overhead)
-BATCH_REPORT = 500   # how often each thread reports to Stats
 
 def run(target: str, port: int, mode: dict):
     stats     = Stats()
