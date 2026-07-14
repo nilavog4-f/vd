@@ -287,22 +287,30 @@ def main():
 
     # ── Input ─────────────────────────────────────────────────────
     console.print("  [bright_red]◈[/]  ", end="")
-    host = input("Target IP or hostname: ").strip()
+    host = input("Target IP, hostname or URL (e.g. google.com): ").strip()
     if not host:
         console.print("  [red][!] No target entered.[/]"); return
+
+    # Strip protocol/path from URLs so "https://site.com" works too
+    host = re.sub(r"^(https?://)|(/.*)$", "", host, flags=re.IGNORECASE).strip()
 
     # Resolve hostname
     try:
         resolved = socket.gethostbyname(host)
         if resolved != host:
-            console.print(f"  [dim]Resolved:[/]  [bold yellow]{resolved}[/]")
+            console.print(f"  [dim]Resolved:[/]  [bold yellow]{host}[/] → [bright_white]{resolved}[/]")
     except Exception:
         console.print(f"  [bold red][!][/]  Cannot resolve: [yellow]{host}[/]")
         return
 
     console.print("  [bright_red]◈[/]  ", end="")
-    raw_port = input("Port (default 80, Minecraft Java = 25565, Bedrock = 19132): ").strip()
-    port = int(raw_port) if raw_port.isdigit() else 80
+    raw_port = input("Port (default 80 for websites, 443 HTTPS, 25565 Minecraft): ").strip()
+    if raw_port.lower() in ("https", "ssl"):
+        port = 443
+    elif raw_port.isdigit():
+        port = int(raw_port)
+    else:
+        port = 80
 
     # Detect Minecraft
     is_mc = port in (MC_JAVA_PORT, MC_BEDROCK_PORT)
