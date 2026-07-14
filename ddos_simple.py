@@ -9,7 +9,7 @@ import subprocess, sys, os
 def _ensure_deps():
     for mod, pkg in [("rich","rich"),("pyfiglet","pyfiglet")]:
         try:
-            _import_(mod)
+            __import__(mod)
         except ImportError:
             print(f"[*] Installing {pkg}...")
             try:
@@ -189,7 +189,7 @@ def _build_packet(mode_key: str, src_ip: str, dst_ip: str, sport: int, dport: in
 
 class FastStats:
     """High-performance stats with minimal locking."""
-    def _init_(self):
+    def __init__(self):
         self._lock = threading.Lock()
         self.sent = 0
         self.replies = 0
@@ -620,7 +620,7 @@ def show_geo_attack_map(target: str, mode_label: str, mode_color: str):
     for i, region in enumerate(REGION_ORDER):
         active.add(region)
         n = sum(1 for _, _, r in ATTACK_NODES if r == region)
-        console.print(f"  [bright_red]▶️[/]  [bold white]{REGION_LABELS[region]:<16}[/]  "
+        console.print(f"  [bright_red]▶[/]  [bold white]{REGION_LABELS[region]:<16}[/]  "
                       f"[bright_red]{n} nodes[/]  [bold bright_green][ ONLINE ][/]")
         map_txt = _render_map(active)
         console.print(Align.center(map_txt))
@@ -875,7 +875,7 @@ def main():
         stop_event.set()
         console.print("\n  [yellow]Stopped.[/]\n")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     try:
         main()
     except Exception as e:
