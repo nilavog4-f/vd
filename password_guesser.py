@@ -61,6 +61,7 @@ from rich.align    import Align
 from rich.rule     import Rule
 from rich.panel    import Panel
 from rich.progress import Progress, BarColumn, TextColumn
+from rich import box
 import pyfiglet
 
 console = Console()
