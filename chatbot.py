@@ -472,7 +472,7 @@ HOW IT WORKS:
      - OpenRouter key: sk-or-v1-[a-zA-Z0-9]{64}
      - GitHub PAT: (ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}
      - Private key block: -----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----
-     - Generic password: password\s*[=:]\s*["']?[^\s"']{8,}
+     - Generic password: password\\s*[=:]\\s*["']?[^\\s"']{8,}
      - .env patterns: API_KEY=, SECRET=, TOKEN=, PASSWD=
      - Stripe: sk_live_[0-9a-zA-Z]{24}
      - Twilio: SK[0-9a-fA-F]{32}
@@ -914,7 +914,6 @@ flask:
 - You remember context within the session — refer back to earlier messages when relevant
 
 You were built alongside @lfw.k4rma_. You know this toolkit inside out. GitHub: https://github.com/nilavog4-f/vt. You are ready.
-"""
 
 ──────────────────────────────────────
 [1] phone_deep.py — Phone Deep Scan
@@ -1151,40 +1150,50 @@ ENGINE (pure Python, no external tools):
   - _build_packet(mode_key,...): assembles IP+TCP/UDP/ICMP into one raw packet bytes object
   - socket.AF_INET / SOCK_RAW / IPPROTO_RAW + IP_HDRINCL=1 for full header control
 
-SENDER THREADS (N_THREADS = 16):
-  - Each thread opens its own raw socket, randomizes src IP + sport per packet
-  - Non-blocking socket (setblocking(False)) — tight send loop, no sleep unless BlockingIOError
-  - Batches 50 packets before updating Stats to reduce lock contention
-  - Total theoretical rate: hundreds of thousands of pps depending on system
+SENDER THREADS (N_THREADS = 128):
+  - Each thread opens its own raw socket with 8MB SO_SNDBUF
+  - Pre-allocated pool of 10,000 random IPs + ports (avoids per-packet generation overhead)
+  - Non-blocking socket (setblocking(False)) — tight send loop
+  - time.sleep(0) every 1000 packets to yield CPU — PREVENTS SYSTEM FREEZE
+  - Batches 100 packets before updating Stats to reduce lock contention
+  - Total theoretical rate: millions of pps on good hardware
 
 REPLY LISTENER THREAD:
-  - TCP modes (SYN/ACK): SOCK_RAW IPPROTO_TCP — filters src IP = target, src port = target port
-  - ICMP/UDP modes: SOCK_RAW IPPROTO_ICMP — catches echo reply (type=0) or port unreachable (type=3)
-  - _decode_tcp_flags(flags): bitmask decode → "SYN+ACK", "RST+ACK", "RST", etc.
-  - _flag_meaning(): plain English per flag combo
+  - Uses select.select() with 1ms timeout — non-blocking, no CPU spin
+  - TCP modes (SYN/ACK): SOCK_RAW IPPROTO_TCP — filters by src_port=target_port ONLY
+  - DOES NOT filter by source IP — CDN/Cloudflare reply from different edge IPs, strict IP filter = 0 replies
+  - ICMP/UDP modes: SOCK_RAW IPPROTO_ICMP — catches echo reply (type=0), port unreachable (type=3), TTL exceed (type=11)
+  - Uses correct ip_ihl offset for ICMP — not hardcoded pkt[20]
+  - HTTP mode (mode 5): replies counted inside sender, listener exits immediately
 
-STATS CLASS (thread-safe):
-  - threading.Lock() on all writes
-  - _history: rolling list of (timestamp, sent_count) for last 3s — used for real pps rate
-  - pps(): calculates rolling 3-second packets-per-second from history
-  - snapshot(): returns dict of all current values for display
-
-LIVE DASHBOARD (Rich Live, refreshes 4x/sec):
-  - Panel with DOUBLE_EDGE border, title "VOID STRESS TEST — ∞ INFINITE"
-  - Grid table: TARGET/MODE/SENT/RATE/REPLIES/LOSS/THREADS/UPTIME
-  - RATE bar: ratio = pps/100,000 (scales to bar width)
-  - REPLY bar: ratio = replies/sent
-  - LAST row: last reply flag + plain English meaning
-  - Updates every 0.25s in main loop
-
-GEO MAP (same as before):
-  - 16-row ASCII world map, 22 nodes across 7 regions
-  - Lights up region by region (0.5s each), ANSI cursor-up for in-place redraw
-  - Convergence animation (4 frames) → "ALL 22 NODES LOCKED ON TARGET"
+INPUT: Accepts raw IP, hostname, or URL — strips https:// and paths automatically
 
 MODES:
-  1 SYN  (F_SYN=0x002) · 2 UDP (IPPROTO_UDP) · 3 ICMP (type=8) · 4 ACK (F_ACK=0x010)
+  1 SYN Flood  — fake TCP handshakes, fills connection table
+  2 UDP Flood  — random UDP datagrams, bandwidth exhaustion
+  3 ICMP Flood — ICMP echo requests, overwhelms network interface
+  4 ACK Flood  — fake TCP acknowledgements, confuses stateful firewalls
+  5 HTTP Flood — Layer 7, opens REAL TCP connections + sends HTTP GET requests
+                 Best against websites/CDN — bypasses raw packet filters (no sudo needed for HTTP mode)
+
 KEY OUTPUT: Rich Live dashboard (pps, sent, replies, loss%, rate bar) · geo map · final summary + verdict
+
+──────────────────────────────────────
+[15] ddos_triple.py — Triple Instance DDOS
+──────────────────────────────────────
+PURPOSE : Launches 3 simultaneous attack instances against the same target — 3× the throughput.
+INPUT   : Target IP/hostname/URL + port + mode (prompted once, applied to all 3 instances)
+REQUIRES: sudo (raw sockets)
+WHAT IT DOES:
+  - Asks target/port/mode ONCE with the same styled VOID interface
+  - Shows geo attack map once
+  - Spawns 3 multiprocessing.Process workers (true OS processes — separate PIDs, separate NICs queues)
+  - Each worker runs 128 sender threads = 384 total threads attacking simultaneously
+  - Main process shows a combined Rich Live dashboard: INSTANCE 1 / INSTANCE 2 / INSTANCE 3 stats side by side
+  - Shared stats via multiprocessing.Value (ctypes integers)
+  - Combined PPS is sum of all 3 instances
+  - HTTP mode (5) works across all 3 processes for website targets
+KEY OUTPUT: 3-panel combined dashboard showing per-instance + combined totals
 
 ════════════════════════════════════════
   SHARED INFRASTRUCTURE
@@ -1196,7 +1205,7 @@ osint_config.json — shared config file used by phone2.py, osint2.py, ip_intel.
 run.sh — main launcher (bash run.sh from void-osint/)
   - Detects WSL vs native Linux, detects Kali
   - Installs all packages from requirements.txt at startup
-  - Shows menu with 13 tools, numbered 1–13
+  - Shows menu with 15 tools, numbered 1–15
   - Each tool shows: name, description, ** <expected input> placeholder, ●/○ file presence indicator
   - After a tool exits, returns to menu automatically
 
