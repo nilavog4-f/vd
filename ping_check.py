@@ -392,3 +392,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         console.print(f"\n  [bold red][!] Error:[/]  [red]{exc}[/]\n")
+
