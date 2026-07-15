@@ -176,7 +176,7 @@ show_menu() {
     "11" "Scare Prank"     "scare_prank.sh"       "Fake hack scare screen — harmless prank"         "$CRIMSON" "<no input — just run it>"
     "12" "Ping Monitor"    "ping_check.py"        "Live RTT · stability · DDoS detection · MC"      "$ORANGE"  "<ip or hostname + port>"
     "13" "Port Scanner"    "port_scan.py"         "TCP/UDP · banner grab · Minecraft · vuln flags"  "$BLOOD"   "<ip address or hostname>"
-    "15" "DDOS × 3"       "ddos_triple.py"       "3 instances simultaneously · 384 threads · sudo"  "$BLOOD"   "<target ip + port + mode (prompted once)>"
+    "14" "DDOS × 3"       "ddos_triple.py"       "3 instances simultaneously · 384 threads · sudo"  "$BLOOD"   "<target ip + port + mode (prompted once)>"
   )
 
   local i=0
