@@ -177,6 +177,7 @@ show_menu() {
     "12" "Ping Monitor"    "ping_check.py"        "Live RTT · stability · DDoS detection · MC"      "$ORANGE"  "<ip or hostname + port>"
     "13" "Port Scanner"    "port_scan.py"         "TCP/UDP · banner grab · Minecraft · vuln flags"  "$BLOOD"   "<ip address or hostname>"
     "14" "DDOS"            "ddos_simple.py"       "raw sockets · geo map · infinite · needs sudo"   "$CRIMSON" "<target ip + port + mode>"
+    "15" "DDOS × 3"       "ddos_triple.py"       "3 instances simultaneously · 384 threads · sudo"  "$BLOOD"   "<target ip + port + mode (prompted once)>"
   )
 
   local i=0
@@ -329,6 +330,7 @@ while true; do
     12) launch "ping_check.py"       "Ping Monitor"  "$ORANGE"  ;;
     13) launch "port_scan.py"        "Port Scanner"  "$BLOOD"   ;;
     14) launch_sudo "ddos_simple.py"  "DDOS"          "$CRIMSON" ;;
+    15) launch_sudo "ddos_triple.py"  "DDOS x3"       "$BLOOD"   ;;
     q|Q|quit|exit)
       clear; echo ""
       rule "═" "$BLOOD"
