@@ -328,8 +328,7 @@ while true; do
     11) launch_sh "scare_prank.sh"   "Scare Prank"   "$CRIMSON";;
     12) launch "ping_check.py"       "Ping Monitor"  "$ORANGE"  ;;
     13) launch "port_scan.py"        "Port Scanner"  "$BLOOD"   ;;
-    14) launch_sudo "ddos_simple.py"  "DDOS"          "$CRIMSON" ;;
-    15) launch_sudo "ddos_triple.py"  "DDOS x3"       "$BLOOD"   ;;
+    14) launch_sudo "ddos_triple.py"  "DDOS x3"       "$BLOOD"   ;;
     q|Q|quit|exit)
       clear; echo ""
       rule "═" "$BLOOD"
