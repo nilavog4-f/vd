@@ -349,9 +349,12 @@ def main():
 
     # ── Input ─────────────────────────────────────────────────────
     console.print("  [bright_red]◈[/]  ", end="")
-    host = input("Target IP or hostname: ").strip()
+    host = input("Target IP, hostname, or URL (https://site.com): ").strip()
     if not host:
         console.print("  [red][!] No target entered.[/]"); return
+    # Strip protocol/path so URLs work: https://google.com/path → google.com
+    import re as _re
+    host = _re.sub(r'^https?://', '', host).split('/')[0].split(':')[0].strip()
 
     try:
         resolved = socket.gethostbyname(host)
