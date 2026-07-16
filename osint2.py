@@ -40,7 +40,7 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f: return json.load(f)
     cfg = {"api_key": "", "model": "openai/gpt-4o-mini"}
-    open(CONFIG_FILE,"w").write(json.dumps(cfg, indent=2))
+    with open(CONFIG_FILE, "w") as _f: _f.write(json.dumps(cfg, indent=2))
     return cfg
 
 config  = load_config()
@@ -267,7 +267,7 @@ def bing_search(query: str, n: int = 8) -> list:
                 results.append({"href": url, "title": title or url[:80], "body": body[:250]})
                 seen.add(url)
         return results
-    except: return []
+    except Exception: return []
 
 def google_search(query: str, n: int = 8) -> list:
     try:
@@ -294,7 +294,7 @@ def google_search(query: str, n: int = 8) -> list:
                 seen.add(url)
                 if len(results) >= n: break
         return results
-    except: return []
+    except Exception: return []
 
 def multi_search(query: str) -> list:
     seen, combined = set(), []
@@ -374,20 +374,20 @@ def ip_lookup(ip: str) -> dict:
     try:
         r = SESS.get(f"https://ipapi.co/{ip}/json/", timeout=6)
         return r.json()
-    except: return {}
+    except Exception: return {}
 
 def hibp_check(email: str) -> list:
     try:
         r = SESS.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{requests.utils.quote(email)}",
                      headers={"hibp-api-key": "none"}, timeout=6)
         return r.json() if r.status_code == 200 else []
-    except: return []
+    except Exception: return []
 
 def leakcheck(email: str) -> dict:
     try:
         r = SESS.get(f"https://leakcheck.io/api/public?check={email}", timeout=6)
         return r.json() if r.status_code == 200 else {}
-    except: return {}
+    except Exception: return {}
 
 def gravatar_lookup(email: str) -> dict:
     """Check Gravatar for profile image, real name, bio, location, and linked social accounts."""
@@ -402,7 +402,7 @@ def gravatar_lookup(email: str) -> dict:
     try:
         r = SESS.get(f"https://www.gravatar.com/avatar/{h}?d=404", timeout=7)
         out["exists"] = (r.status_code == 200)
-    except: pass
+    except Exception: pass
     if out["exists"]:
         try:
             r2 = SESS.get(f"https://www.gravatar.com/{h}.json", timeout=7)
@@ -417,7 +417,7 @@ def gravatar_lookup(email: str) -> dict:
                     {"domain": a.get("domain",""), "display": a.get("display",""), "url": a.get("url","")}
                     for a in (e.get("accounts") or [])
                 ]
-        except: pass
+        except Exception: pass
     return out
 
 def google_account_check(email: str) -> dict:
@@ -435,7 +435,7 @@ def google_account_check(email: str) -> dict:
             result["exists"] = True
             result["detail"] = "Active Gmail/Google account confirmed via GXLU check"
             return result
-    except: pass
+    except Exception: pass
     try:
         # Fallback: Google sign-in identifier step
         r2 = requests.post(
@@ -523,7 +523,7 @@ def github_email_leak(username: str) -> dict:
             result["created_at"]   = u.get("created_at", "")
             if u.get("email"):
                 result["emails"].append(u["email"])
-    except: pass
+    except Exception: pass
     if not result["found"]:
         return result
     # Mine commit history for leaked email addresses
@@ -543,7 +543,7 @@ def github_email_leak(username: str) -> dict:
                             result["emails"].append(em)
                         if nm and not result["name"]:
                             result["name"] = nm
-    except: pass
+    except Exception: pass
     # Grab top repos for context
     try:
         r3 = SESS.get(f"https://api.github.com/users/{username}/repos",
@@ -556,7 +556,7 @@ def github_email_leak(username: str) -> dict:
                  "language": rp.get("language","") or ""}
                 for rp in r3.json()
             ]
-    except: pass
+    except Exception: pass
     return result
 
 def build_queries(target: dict) -> list:
