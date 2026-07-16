@@ -57,7 +57,7 @@ OPENROUTER  = "https://openrouter.ai/api/v1/chat/completions"
 def _load_cfg():
     try:
         if os.path.exists(CONFIG_FILE):
-            c = open(CONFIG_FILE).read().strip()
+            with open(CONFIG_FILE) as _f: c = _f.read().strip()
             if c: return json.loads(c)
     except Exception: pass
     return {"api_key": "", "model": "openai/gpt-4o-mini"}
