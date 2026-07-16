@@ -1044,7 +1044,7 @@ def run(target: str, port_list: list, mode: dict, n_threads: int):
     console.print()
     console.print(Rule("[bold bright_red]  SESSION SUMMARY  [/]", style="bright_red"))
     console.print()
-    console.print(f"  [dim]Target          [/]  [bold yellow]{target}:{port}[/]")
+    console.print(f"  [dim]Target          [/]  [bold yellow]{target}:{','.join(str(p) for p in port_list)}[/]")
     console.print(f"  [dim]Mode            [/]  [bold {col}]{label}[/]")
     console.print(f"  [dim]Source          [/]  [bold white]{'SPOOFED' if USE_SPOOF else LOCAL_IP+' (real IP)'}[/]")
     console.print(f"  [dim]Engine          [/]  [bold white]Python raw sockets · {n_threads} threads · blocking[/]")
@@ -1112,7 +1112,7 @@ def main():
 
     USE_SPOOF  = args.spoof
     n_threads  = int(args.threads) if args.threads.isdigit() else N_THREADS
-    n_instances = max(1, min(12, args.instances if not args.triple else 3))
+    n_instances = max(1, min(12, args.instances if not args.triple else 3)) if args.instances != 1 or args.triple else 12
 
     # Parse proxies
     proxy_list: list = []
