@@ -50,21 +50,55 @@ stop_event = threading.Event()
 # ══════════════════════════════════════════════════════════════════
 
 def get_local_ip(target: str = "8.8.8.8") -> str:
+    """Return the machine's real routable IPv4 address. Never 0.0.0.0."""
+    probe = target if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target) else "8.8.8.8"
+
+    # 1. UDP connect to a public address — usually the fastest
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2)
-        s.connect((target, 80))
+        s.connect((probe, 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        if ip and not ip.startswith("127."):
+            return ip
     except Exception:
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-            if not ip.startswith("127."):
-                return ip
-        except Exception:
-            pass
-        return "0.0.0.0"
+        pass
+
+    # 2. hostname resolution
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    # 3. Parse Linux routing table (works on WSL, bare-metal, iSH)
+    try:
+        import subprocess
+        out = subprocess.run(["ip", "route", "get", probe],
+                             capture_output=True, text=True, timeout=3).stdout
+        for tok in out.split():
+            if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", tok) and not tok.startswith("127."):
+                return tok
+    except Exception:
+        pass
+
+    # 4. Fallback: scrape interfaces
+    try:
+        import subprocess
+        out = subprocess.run(["ip", "addr"], capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            m = re.search(r"inet\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
+            if m:
+                ip = m.group(1)
+                if ip and not ip.startswith("127."):
+                    return ip
+    except Exception:
+        pass
+
+    # 5. Final fallback — better than 0.0.0.0
+    return "127.0.0.1"
 
 LOCAL_IP  : str  = "0.0.0.0"   # FIX: never empty — set before any use
 USE_SPOOF : bool = False
@@ -716,14 +750,17 @@ def show_mode_menu():
         console.print()
 
 def resolve(target: str) -> str:
+    target = target.strip()
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
         return target
     try:
         ip = socket.gethostbyname(target)
         console.print(f"  [dim]Resolved:[/]  [bold yellow]{target}[/] → [bright_white]{ip}[/]")
         return ip
-    except Exception:
-        return target
+    except Exception as e:
+        console.print(f"\n  [bold red][!][/]  Could not resolve [bold yellow]{target}[/]: {e}")
+        console.print(f"  [dim]Use an IP address directly if DNS is failing.[/]\n")
+        sys.exit(1)
 
 def _bar(ratio: float, width: int = 28, col: str = "bright_red") -> Text:
     ratio  = max(0.0, min(ratio, 1.0))
@@ -1037,9 +1074,12 @@ def main():
         target = resolve(raw_t)
 
     LOCAL_IP = get_local_ip(target)   # FIX: always set before any _src_ip() call
-    src_mode = ("[bright_red]SPOOFED[/] [dim](--spoof set — may drop on WSL NAT)[/]"
-                if USE_SPOOF else
-                f"[bright_white]{LOCAL_IP}[/] [dim](real IP)[/]")
+    if USE_SPOOF:
+        src_mode = "[bright_red]SPOOFED[/] [dim](--spoof set — may drop on WSL NAT)[/]"
+    elif LOCAL_IP.startswith("127."):
+        src_mode = f"[bright_yellow]{LOCAL_IP}[/] [dim](fallback — could not detect real IP)[/]"
+    else:
+        src_mode = f"[bright_white]{LOCAL_IP}[/] [dim](real IP)[/]"
     console.print(f"  [dim]Source IP:[/]  {src_mode}")
 
     # ── port ─────────────────────────────────────────────────────
