@@ -55,7 +55,7 @@ STREAM       = False       # set True if you want streaming (experimental)
 def _load_cfg() -> dict:
     try:
         if os.path.exists(CONFIG_FILE):
-            c = open(CONFIG_FILE).read().strip()
+            with open(CONFIG_FILE) as _f: c = _f.read().strip()
             if c:
                 return json.loads(c)
     except Exception:
