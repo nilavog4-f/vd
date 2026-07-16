@@ -102,19 +102,19 @@ def veriphone_lookup(number: str) -> dict:
     try:
         r = SESS.get(f"https://api.veriphone.io/v2/verify?phone={requests.utils.quote(number)}&key=demo", timeout=8)
         return r.json() if r.status_code == 200 else {}
-    except: return {}
+    except Exception: return {}
 
 def numverify_lookup(number: str) -> dict:
     try:
         r = SESS.get(f"http://apilayer.net/api/validate?access_key=demo&number={requests.utils.quote(number)}&format=1", timeout=8)
         return r.json() if r.status_code == 200 else {}
-    except: return {}
+    except Exception: return {}
 
 def abstract_lookup(number: str) -> dict:
     try:
         r = SESS.get(f"https://phonevalidation.abstractapi.com/v1/?api_key=demo&phone={requests.utils.quote(number)}", timeout=8)
         return r.json() if r.status_code == 200 else {}
-    except: return {}
+    except Exception: return {}
 
 US_AREA_CODES = {
     "201":"Jersey City, NJ","202":"Washington, DC","203":"Bridgeport, CT","205":"Birmingham, AL",
@@ -287,7 +287,7 @@ def truecaller_scrape(number: str) -> dict:
                 if "scam" in r.text.lower():
                     info["tags"].append("Scam risk")
                 break
-        except:
+        except Exception:
             pass
 
     # 3. Also check sync.me and WhoCallsMe
@@ -473,7 +473,7 @@ def bing_phone_search(query: str, n: int = 8) -> list:
                 results.append({"href": url, "title": title or url[:80], "body": body[:250]})
                 seen.add(url)
         return results
-    except: return []
+    except Exception: return []
 
 def google_phone_search(query: str, n: int = 8) -> list:
     try:
@@ -500,7 +500,7 @@ def google_phone_search(query: str, n: int = 8) -> list:
                 seen.add(url)
                 if len(results) >= n: break
         return results
-    except: return []
+    except Exception: return []
 
 def multi_phone_search(query: str) -> list:
     seen, combined = set(), []
