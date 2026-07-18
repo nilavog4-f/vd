@@ -328,6 +328,38 @@ async def api_roles(gid):          return await _req("GET", f"/guilds/{gid}/role
 async def api_emojis(gid):         return await _req("GET", f"/guilds/{gid}/emojis")   or []
 async def api_self():              return await _req("GET", "/users/@me")
 
+async def verify_token_verbose():
+    """Return (ok: bool, me_or_error: dict|str). Prints detailed diagnostics."""
+    global _SESSION
+    if _SESSION is None:
+        conn = _make_connector()
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        _SESSION = aiohttp.ClientSession(connector=conn, timeout=timeout)
+
+    url = f"{BASE_URL}/users/@me"
+    try:
+        async with _SESSION.get(url, headers=HDRS) as resp:
+            body = await resp.json(content_type=None) if resp.content_length != 0 else {}
+            if resp.status == 200:
+                return True, body
+            if resp.status == 401:
+                return False, f"HTTP {resp.status} — token is invalid or bot was deleted/reset"
+            if resp.status == 403:
+                return False, f"HTTP {resp.status} — token lacks 'Identify' scope / bot suspended"
+            if resp.status == 429:
+                return False, f"HTTP {resp.status} — rate limited (retry_after={body.get('retry_after','?')}s)"
+            if resp.status >= 500:
+                return False, f"HTTP {resp.status} — Discord server error (try again)"
+            return False, f"HTTP {resp.status} — {body.get('message', 'unknown')}"
+    except aiohttp.ClientConnectorError as e:
+        return False, f"Network error — cannot reach Discord: {e}"
+    except aiohttp.ClientError as e:
+        return False, f"Connection error: {e}"
+    except asyncio.TimeoutError:
+        return False, "Timeout — Discord is not responding (check network/VPN)"
+    except Exception as e:
+        return False, f"Unexpected error: {type(e).__name__}: {e}"
+
 async def api_members(gid):
     """Paginate all members — each page up to 1000, sequential (API limit)."""
     out, after = [], 0
@@ -842,18 +874,39 @@ async def _run(choice: str, guild_id: str | None):
 # MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 async def main():
-    global _SESSION
+    global _SESSION, TOKEN, HDRS
     conn     = _make_connector()
     timeout  = aiohttp.ClientTimeout(total=15, connect=5)
     _SESSION = aiohttp.ClientSession(connector=conn, timeout=timeout)
 
     _banner()
     _status("Verifying token…")
-    me = await api_self()
-    if not me:
-        _fail("Invalid token or no network.")
-        await _SESSION.close()
-        sys.exit(1)
+    ok, me = await verify_token_verbose()
+
+    if not ok:
+        _fail(me)  # me is the error string here
+        console.print()
+        console.print("  [dim]Common fixes:[/]")
+        console.print("  •  pip install aiohttp")
+        console.print("  •  Check internet / VPN / firewall")
+        console.print("  •  The hardcoded token may be invalid / reset / bot deleted")
+        console.print()
+        try:
+            ans = input("  Replace token now? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans == "y":
+            TOKEN = input("  New bot token: ").strip()
+            HDRS["Authorization"] = f"Bot {TOKEN}"
+            _status("Retrying with new token…")
+            ok, me = await verify_token_verbose()
+            if not ok:
+                _fail(me)
+                await _SESSION.close()
+                sys.exit(1)
+        else:
+            await _SESSION.close()
+            sys.exit(1)
 
     me_name = me.get("username","?")
     me_id   = me.get("id","?")
