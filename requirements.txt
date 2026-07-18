@@ -1,7 +1,8 @@
-requests
-rich
-pyfiglet
-ddgs
-flask
-beautifulsoup4
-phonenumbers
+requests==2.32.3
+rich==13.9.4
+pyfiglet==1.0.2
+ddgs==6.3.5
+flask==3.1.0
+beautifulsoup4==4.12.3
+phonenumbers==8.13.55
+aiohttp==3.11.11
