@@ -498,7 +498,7 @@ def _menu(me_name: str, me_id: str, guild_id: str | None):
 def _need_gid(fn):
     """Wrap an original-style op(gid, extra) so it matches the new signature."""
     async def _wrapper(guild_id):
-        gid = guild_id or _input("  Server ID: ")
+        gid = guild_id or await _input("  Server ID: ")
         if not gid:
             _warn("No server ID entered, cancelled."); return guild_id
         await fn(gid)
@@ -509,10 +509,10 @@ def _need_gid(fn):
 def _need_gid_extra(fn, prompt: str):
     """Wrap an op that also needs an extra prompt."""
     async def _wrapper(guild_id):
-        gid = guild_id or _input("  Server ID: ")
+        gid = guild_id or await _input("  Server ID: ")
         if not gid:
             _warn("No server ID entered, cancelled."); return guild_id
-        extra = _input(f"  {prompt}") or None
+        extra = await _input(f"  {prompt}") or None
         await fn(gid, extra)
         return gid
     _wrapper.__name__ = fn.__name__
@@ -544,22 +544,32 @@ async def op_full_nuke(gid, _=None):
         await _flood_via_webhooks(new_chs, NUKE_MSG, webhooks_per_channel=6, rounds=40)
     _ok(f"Full nuke complete — {len(new_chs)} channels flooded")
 
-# ── Safe input helper — flushes stray newlines left by async operations ───────
+# ── Safe input helper — flushes the terminal input queue before every prompt ──
+# This prevents keystrokes typed while an async operation was running from being
+# read as the next choice.
 def _flush_stdin():
     try:
-        import sys, select
-        while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0)
-            if not r:
-                break
-            if sys.stdin.read(1) == "\n":
-                break
+        import sys, termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except Exception:
-        pass
+        # Fallback for non-TTY / Windows
+        try:
+            import sys, select, os
+            fd = sys.stdin.fileno()
+            while True:
+                r, _, _ = select.select([fd], [], [], 0)
+                if not r:
+                    break
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+        except Exception:
+            pass
 
-def _input(prompt: str) -> str:
+async def _input(prompt: str) -> str:
     _flush_stdin()
-    return input(prompt).strip()
+    # Run input() in a thread so it never blocks the asyncio event loop
+    return (await asyncio.to_thread(input, prompt)).strip()
 
 async def op_bypass(gid, _=None):
     _status("Fetching data…")
@@ -692,7 +702,7 @@ async def op_webhook_spam(gid, _=None):
 
 async def op_dm_spam(gid, extra=None):
     if not extra:
-        try: extra = _input("  USER_ID,message: ")
+        try: extra = await _input("  USER_ID,message: ")
         except (EOFError, KeyboardInterrupt): return
     parts = extra.split(",", 1)
     if len(parts) < 2:
@@ -757,7 +767,7 @@ async def op_server_info(gid, _=None):
                         border_style=YELLOW, box=box.DOUBLE_EDGE))
 
 async def op_user_info(gid, extra=None):
-    uid = extra or _input("  User ID: ")
+    uid = extra or await _input("  User ID: ")
     ST.set_total(2)
     with Live(console=console, refresh_per_second=4, transient=True) as live:
         live.update(_progress_panel("FETCHING USER INFO", "bright_white"))
@@ -791,7 +801,7 @@ async def op_reload_bot(guild_id: str | None) -> str | None:
         _fail(f"Reload failed: {me}")
         console.print("  [dim]Token may have been reset. Enter the new one:[/]")
         try:
-            raw = _input("  New bot token (or Enter to skip): ")
+            raw = await _input("  New bot token (or Enter to skip): ")
         except (EOFError, KeyboardInterrupt):
             raw = ""
         if raw:
@@ -875,7 +885,7 @@ async def _dispatch(choice: str, guild_id: str | None) -> str | None:
     gid = guild_id
     if needs_gid and not gid:
         try:
-            gid = _input("  Server ID: ")
+            gid = await _input("  Server ID: ")
         except (EOFError, KeyboardInterrupt):
             _warn("Cancelled."); return guild_id
         if not gid:
@@ -886,7 +896,7 @@ async def _dispatch(choice: str, guild_id: str | None) -> str | None:
     extra = None
     if needs_extra and extra_prompt:
         try:
-            extra = _input(f"  {extra_prompt}") or None
+            extra = await _input(f"  {extra_prompt}") or None
         except (EOFError, KeyboardInterrupt):
             extra = None
 
@@ -932,7 +942,7 @@ async def _prompt_and_verify() -> tuple[bool, dict | str]:
         console.print("  [dim](Get it from discord.com/developers → Your App → Bot → Reset Token)[/]")
         console.print()
         try:
-            raw = _input("  Token: ")
+            raw = await _input("  Token: ")
         except (EOFError, KeyboardInterrupt):
             return False, "Cancelled."
         if not raw:
@@ -949,7 +959,7 @@ async def _prompt_and_verify() -> tuple[bool, dict | str]:
         _fail(str(result))
         console.print()
         try:
-            again = _input("  Try a different token? [Y/n]: ").lower()
+            again = await _input("  Try a different token? [Y/n]: ").lower()
         except (EOFError, KeyboardInterrupt):
             return False, "Cancelled."
         if again == "n":
@@ -1011,7 +1021,7 @@ async def main():
             _menu(me_name, me_id, guild_id)
 
             try:
-                raw = _input("  Choice: ")
+                raw = await _input("  Choice: ")
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -1023,7 +1033,7 @@ async def main():
             # S — set / change server ID
             if raw.upper() == "S":
                 try:
-                    gid = _input("  Server ID: ")
+                    gid = await _input("  Server ID: ")
                     if gid:
                         guild_id = gid
                         _ok(f"Active server set to {guild_id}")
