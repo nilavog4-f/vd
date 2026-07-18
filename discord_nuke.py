@@ -30,13 +30,43 @@ from rich.console import Group
 console = Console(highlight=False)
 
 # ── Token ─────────────────────────────────────────────────────────────────────
-TOKEN    = "MTQ2NjA5MTMwMTczNTg5NTA3MQ.GnwR-p.gIVchDj8UsO0IUlO6_eFTw474j6HUGPtUBJOD0"
-BASE_URL = "https://discord.com/api/v10"
-HDRS     = {
-    "Authorization": f"Bot {TOKEN}",
-    "Content-Type":  "application/json",
-    "User-Agent":    "DiscordBot (void, 2.0)",
+BASE_URL   = "https://discord.com/api/v10"
+TOKEN      = ""          # loaded/set at runtime via _load_token() / _set_token()
+TOKEN_FILE = "token.txt" # saved here so you don't re-enter every run
+
+HDRS: dict = {
+    "Content-Type": "application/json",
+    "User-Agent":   "DiscordBot (void, 2.0)",
 }
+
+def _set_token(raw: str) -> None:
+    """Normalise and apply a new token globally (strips whitespace + accidental 'Bot ' prefix)."""
+    global TOKEN
+    raw = raw.strip()
+    # Remove accidental "Bot " prefix — we always add it ourselves
+    if raw.lower().startswith("bot "):
+        raw = raw[4:].strip()
+    TOKEN = raw
+    HDRS["Authorization"] = f"Bot {TOKEN}"
+
+def _load_token() -> bool:
+    """Load token from token.txt. Returns True if a non-empty token was found."""
+    try:
+        import os
+        raw = open(TOKEN_FILE).read().strip()
+        if raw:
+            _set_token(raw)
+            return True
+    except Exception:
+        pass
+    return False
+
+def _save_token() -> None:
+    """Persist the current TOKEN to token.txt for next run."""
+    try:
+        open(TOKEN_FILE, "w").write(TOKEN)
+    except Exception:
+        pass
 
 NUKE_MSG = "# ☢️ @everyone @here # SERVER NUKED BY VOID!! **EZ KIDDOS** > join now: https://discord.gg/hG7kuYV5X7 ☢️"
 NUKE_CH  = "☢︱NUKED-BY-VOID-KIDS"
@@ -262,23 +292,54 @@ async def api_app_id():
     me = await api_self()
     return me.get("id") if me else None
 
+async def _fresh_session() -> aiohttp.ClientSession:
+    """Close any existing session and open a new one."""
+    global _SESSION
+    if _SESSION is not None:
+        try: await _SESSION.close()
+        except Exception: pass
+        _SESSION = None
+    _SESSION = aiohttp.ClientSession(
+        connector=_make_connector(),
+        timeout=aiohttp.ClientTimeout(total=15, connect=5),
+    )
+    return _SESSION
+
 async def verify_token_verbose():
+    """
+    Verify the current TOKEN against Discord. Always uses the latest HDRS.
+    Returns (ok: bool, me_dict | error_string).
+    """
     global _SESSION
     if _SESSION is None:
-        _SESSION = aiohttp.ClientSession(connector=_make_connector(),
-                                         timeout=aiohttp.ClientTimeout(total=15, connect=5))
+        await _fresh_session()
     try:
         async with _SESSION.get(f"{BASE_URL}/users/@me", headers=HDRS) as resp:
-            body = await resp.json(content_type=None) if resp.content_length != 0 else {}
-            if resp.status == 200: return True, body
-            if resp.status == 401: return False, f"HTTP 401 — token invalid or bot deleted"
-            if resp.status == 403: return False, f"HTTP 403 — token lacks scope / bot suspended"
-            if resp.status == 429: return False, f"HTTP 429 — rate limited"
-            if resp.status >= 500: return False, f"HTTP {resp.status} — Discord server error"
-            return False, f"HTTP {resp.status} — {body.get('message','unknown')}"
-    except aiohttp.ClientConnectorError as e: return False, f"Network error: {e}"
-    except asyncio.TimeoutError:              return False, "Timeout — check network/VPN"
-    except Exception as e:                    return False, f"{type(e).__name__}: {e}"
+            # Always read the body — don't trust content_length (Discord often omits it)
+            try:
+                body = await resp.json(content_type=None)
+            except Exception:
+                body = {}
+            if resp.status == 200:
+                return True, body
+            if resp.status == 401:
+                return False, ("HTTP 401 — Token invalid, expired, or bot was deleted.\n"
+                               "  Regenerate your token in the Discord Developer Portal\n"
+                               "  and paste the NEW token (never reuse an old one).")
+            if resp.status == 403:
+                return False, "HTTP 403 — Token missing scope or bot is suspended."
+            if resp.status == 429:
+                ra = body.get("retry_after", "?")
+                return False, f"HTTP 429 — Rate limited. Retry after {ra}s."
+            if resp.status >= 500:
+                return False, f"HTTP {resp.status} — Discord server error (try again)."
+            return False, f"HTTP {resp.status} — {body.get('message', 'unknown error')}"
+    except aiohttp.ClientConnectorError as e:
+        return False, f"Network error — cannot reach Discord: {e}"
+    except asyncio.TimeoutError:
+        return False, "Timeout — Discord not responding (check internet/VPN)."
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 async def kick(gid, uid):     return await _req("DELETE", f"/guilds/{gid}/members/{uid}")
 async def ban(gid, uid):      return await _req("PUT",    f"/guilds/{gid}/bans/{uid}",
@@ -617,24 +678,30 @@ async def op_unban_member(guild_id: str | None) -> str | None:
 
 
 async def op_reload_bot(guild_id: str | None) -> str | None:
-    """Re-authenticate the bot and reset the session."""
-    global _SESSION, TOKEN, HDRS
+    """Re-authenticate the bot — closes the old session and opens a fresh one."""
     _status("Closing current session…")
-    if _SESSION:
-        await _SESSION.close()
-        _SESSION = None
-
-    _SESSION = aiohttp.ClientSession(
-        connector=_make_connector(),
-        timeout=aiohttp.ClientTimeout(total=15, connect=5)
-    )
+    await _fresh_session()   # always opens a brand-new connection
     ST.reset()
-    _status("Verifying token…")
+    _status("Verifying token with fresh session…")
     ok, me = await verify_token_verbose()
     if ok:
-        _ok(f"Session reloaded — logged in as {me.get('username','?')}")
+        _ok(f"Session reloaded — logged in as {me.get('username','?')} ({me.get('id','')})")
     else:
         _fail(f"Reload failed: {me}")
+        console.print("  [dim]Token may have been reset. Enter the new one:[/]")
+        try:
+            raw = input("  New bot token (or Enter to skip): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raw = ""
+        if raw:
+            _set_token(raw)
+            await _fresh_session()
+            ok2, me2 = await verify_token_verbose()
+            if ok2:
+                _save_token()
+                _ok(f"New token accepted — {me2.get('username','?')}")
+            else:
+                _fail(f"Still failing: {me2}")
     return guild_id
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -698,15 +765,45 @@ async def _dispatch(choice: str, guild_id: str | None) -> str | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
+async def _prompt_and_verify() -> tuple[bool, dict | str]:
+    """
+    Interactively prompt for a token until it works, or the user quits.
+    Always opens a fresh session before each attempt so stale connections
+    never cause false negatives.
+    """
+    while True:
+        console.print()
+        console.print("  [dim]Paste your bot token below.[/]")
+        console.print("  [dim](Get it from discord.com/developers → Your App → Bot → Reset Token)[/]")
+        console.print()
+        try:
+            raw = input("  Token: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False, "Cancelled."
+        if not raw:
+            _warn("No token entered."); continue
+
+        _set_token(raw)
+        _status("Opening fresh connection…")
+        await _fresh_session()
+        _status("Verifying…")
+        ok, result = await verify_token_verbose()
+        if ok:
+            _save_token()
+            return True, result
+        _fail(str(result))
+        console.print()
+        try:
+            again = input("  Try a different token? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False, "Cancelled."
+        if again == "n":
+            return False, "Aborted by user."
+
 async def main():
-    global _SESSION, TOKEN, HDRS
+    global _SESSION
 
-    _SESSION = aiohttp.ClientSession(
-        connector=_make_connector(),
-        timeout=aiohttp.ClientTimeout(total=15, connect=5)
-    )
-
-    # ── Token verification ───────────────────────────────────────────────────
+    # ── Splash ───────────────────────────────────────────────────────────────
     console.clear()
     fig = pyfiglet.figlet_format("VOID  NUKE", font="doom")
     shades = ["bright_red","red","bright_red","red","bright_red","red"]
@@ -715,28 +812,34 @@ async def main():
             console.print(f"  [{shades[i%len(shades)]}]{line}[/]")
     console.print()
     _sep(RED)
-    console.print(f"  [dim]Verifying token…[/]")
+    console.print(f"  [dim]VOID NUKE v2.0  ·  Red Team Terminal  ·  Authorized Use Only[/]")
     _sep(RED)
     console.print()
 
-    ok, me_or_err = await verify_token_verbose()
+    # ── Token: load saved → verify → prompt if needed ────────────────────────
+    await _fresh_session()   # always start with a clean session
+
+    have_saved = _load_token()
+    ok = False
+    me_or_err: dict | str = {}
+
+    if have_saved:
+        _status(f"Loaded saved token from {TOKEN_FILE} — verifying…")
+        ok, me_or_err = await verify_token_verbose()
+        if not ok:
+            _fail(str(me_or_err))
+            console.print()
+            console.print(f"  [dim]Saved token in [bold]{TOKEN_FILE}[/bold] is no longer valid.[/]")
+            console.print("  [dim]This usually means you reset the token in the Discord Developer Portal.[/]")
+            console.print("  [dim]Enter your new token below:[/]")
 
     if not ok:
-        _fail(str(me_or_err))
-        console.print()
-        console.print("  [dim]Fixes: check your token, internet, or VPN.[/]")
-        console.print()
-        try: ans = input("  Replace token now? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt): ans = "n"
-        if ans == "y":
-            TOKEN = input("  New bot token: ").strip()
-            HDRS["Authorization"] = f"Bot {TOKEN}"
-            _status("Retrying…")
-            ok, me_or_err = await verify_token_verbose()
-            if not ok:
-                _fail(str(me_or_err)); await _SESSION.close(); sys.exit(1)
-        else:
-            await _SESSION.close(); sys.exit(1)
+        ok, me_or_err = await _prompt_and_verify()
+        if not ok:
+            _fail(str(me_or_err))
+            try: await _SESSION.close()
+            except Exception: pass
+            sys.exit(1)
 
     me      = me_or_err
     me_name = me.get("username", "Unknown")
